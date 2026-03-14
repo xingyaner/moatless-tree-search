@@ -23,31 +23,75 @@ class FuzzBuild(Action):
     architecture: str = ""
 
     def execute(self, args: FuzzBuildArgs, file_context=None, workspace=None) -> Observation:
-        """执行黑盒构建动作。"""
-        # 调用此前定义的 standalone 工具
-        res = run_fuzz_build_standalone(
+        """执行黑盒构建动作，并实现实时日志流式打印。"""
+        import os
+        import subprocess
+
+        print(f"\n--- [Isolated Build Started] Project: {self.project_name} ---")
+
+        # 1. 构造 OSS-Fuzz 标准构建命令
+        helper_path = os.path.join(self.oss_fuzz_path, "infra/helper.py")
+        command = [
+            "python3", helper_path, "build_fuzzers",
             self.project_name,
-            self.oss_fuzz_path,
-            self.sanitizer,
-            self.engine,
-            self.architecture
-        )
+            "--sanitizer", self.sanitizer,
+            "--engine", self.engine,
+            "--architecture", self.architecture
+        ]
 
-        log_content = ""
-        log_path = res.get('log_path', "")
-        if os.path.exists(log_path):
-            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-                # 仅返回末尾 500 行作为黑盒反馈
-                log_content = "".join(lines[-500:])
+        # 确保日志存储目录存在
+        log_dir = "fuzz_build_log_file"
+        log_file_path = os.path.join(log_dir, "fuzz_build_log.txt")
+        os.makedirs(log_dir, exist_ok=True)
 
-        if res['status'] == "success":
-            return Observation(
-                message="BUILD SUCCESSFUL. All fuzzing targets were built successfully.",
-                summary="Success"
+        full_log_content = []
+
+        # 2. 使用 Popen 执行并实时捕获输出
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=self.oss_fuzz_path,
+                encoding='utf-8',
+                errors='ignore'
             )
-        else:
-            return Observation(
-                message=f"BUILD FAILED. Please analyze the following raw compiler output:\n\n{log_content}",
-                summary="Failure"
-            )
+
+            # 实时流式读取并打印到控制台
+            for line in process.stdout:
+                print(line, end='', flush=True)
+                full_log_content.append(line)
+
+            process.wait()
+            return_code = process.returncode
+            final_log = "".join(full_log_content)
+
+            # 保存完整日志到文件，供后续 Observation 逻辑读取
+            with open(log_file_path, "w", encoding="utf-8") as f:
+                f.write(final_log)
+
+            # 3. 判定逻辑
+            # 兼容：如果 returncode 不为 0 或日志中没有成功标识，则判定为失败
+            is_success = (return_code == 0 and "successfully built" in final_log.lower())
+
+            # 提取末尾 100 行作为给模型的反馈（增加信息密度）
+            log_tail = "".join(full_log_content[-100:])
+
+            if is_success:
+                return Observation(
+                    message="BUILD SUCCESSFUL. All fuzzing targets were built successfully.",
+                    summary="Success"
+                )
+            else:
+                return Observation(
+                    message=f"BUILD FAILED. Please analyze the raw compiler output below:\n\n{log_tail}",
+                    summary="Failure"
+                )
+
+        except Exception as e:
+            error_msg = f"CRITICAL: Build execution failed: {str(e)}"
+            print(error_msg)
+            return Observation(message=error_msg, summary="Error")
+

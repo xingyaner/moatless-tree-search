@@ -12,4 +12,6 @@
   base_image_digest: 8b23955caaed68d9b1d248a868633c63e4b12667cbe61f7062cf42e986a95905
   error_category: RC13
   fixed_state: 'no'
-
+  state: 'yes'
+  fix_result: Failure
+  fix_date: '2026-03-14'

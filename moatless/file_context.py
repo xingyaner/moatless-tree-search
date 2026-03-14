@@ -154,16 +154,17 @@ class ContextFile(BaseModel):
 
     @property
     def module(self) -> Module | None:
-        if not self._repo:
-            return None
-
-        if self._cached_module is not None:
-            return self._cached_module
+        if not self._repo: return None
+        if self._cached_module is not None: return self._cached_module
 
         parser = get_parser_by_path(self.file_path)
         if parser:
-            self._cached_module = parser.parse(self.content)
-
+            try:
+                # 核心修复：拦截 tree-sitter 内部属性缺失导致的崩溃
+                self._cached_module = parser.parse(self.content)
+            except Exception as e:
+                logger.warning(f"AST Parser (tree-sitter) crashed on {self.file_path}: {e}. Falling back to line-based mode.")
+                self._cached_module = None
         return self._cached_module
 
     @property
@@ -628,6 +629,7 @@ class ContextFile(BaseModel):
         self.was_edited = True
 
     def context_size(self):
+        """计算单个 ContextFile 的 Token 大小。"""
         if self.module:
             if self.span_ids is None:
                 return self.module.sum_tokens()
@@ -639,7 +641,13 @@ class ContextFile(BaseModel):
                         tokens += span.tokens
                 return tokens
         else:
-            return 0  # TODO: Support context size...
+            # --- 【核心修复】：为非代码文件（pom.xml等）提供行数估算 ---
+            # 这确保了 ViewCode 在处理非 AST 文件时不会返回 0 或报错
+            content = self.content
+            if not content:
+                return 0
+            return len(content.splitlines()) * 15
+
 
     def has_span(self, span_id: str):
         return span_id in self.span_ids
@@ -655,13 +663,13 @@ class ContextFile(BaseModel):
             self.add_span(span_id, tokens=tokens, pinned=pinned, add_extra=add_extra)
 
     def add_span(
-        self,
-        span_id: str,
-        start_line: Optional[int] = None,
-        end_line: Optional[int] = None,
-        tokens: Optional[int] = None,
-        pinned: bool = False,
-        add_extra: bool = True,
+            self,
+            span_id: str,
+            start_line: Optional[int] = None,
+            end_line: Optional[int] = None,
+            tokens: Optional[int] = None,
+            pinned: bool = False,
+            add_extra: bool = True,
     ) -> bool:
         self.was_viewed = True
         existing_span = next(
@@ -672,26 +680,42 @@ class ContextFile(BaseModel):
             existing_span.tokens = tokens
             existing_span.pinned = pinned
             return False
+
+        # --- 【核心修复】：支持非 AST 文件的手动 Span 注入 ---
+        if not self.module:
+            # 如果没有解析器，直接信任传入的 span_id 并添加
+            self.spans.append(
+                ContextSpan(
+                    span_id=span_id,
+                    start_line=start_line or 1,
+                    end_line=end_line or 1000,
+                    tokens=tokens,
+                    pinned=pinned,
+                )
+            )
+            return True
+        # --------------------------------------------------
+
+        # 原有的 AST 验证逻辑
+        span = self.module.find_span_by_id(span_id)
+        if span:
+            self.spans.append(
+                ContextSpan(
+                    span_id=span_id,
+                    start_line=start_line,
+                    end_line=end_line,
+                    tokens=tokens,
+                    pinned=pinned,
+                )
+            )
+            if add_extra:
+                self._add_class_span(span)
+            return True
         else:
-            span = self.module.find_span_by_id(span_id)
-            if span:
-                self.spans.append(
-                    ContextSpan(
-                        span_id=span_id,
-                        start_line=start_line,
-                        end_line=start_line,
-                        tokens=tokens,
-                        pinned=pinned,
-                    )
-                )
-                if add_extra:
-                    self._add_class_span(span)
-                return True
-            else:
-                logger.warning(
-                    f"Tried to add not existing span id {span_id} in file {self.file_path}"
-                )
-                return False
+            logger.warning(
+                f"Tried to add not existing span id {span_id} in file {self.file_path}"
+            )
+            return False
 
     def _add_class_span(self, span: BlockSpan):
         if span.initiating_block.type != CodeBlockType.CLASS:
@@ -726,9 +750,22 @@ class ContextFile(BaseModel):
     ) -> list[str]:
         self.was_viewed = True
 
+        if start_line is None:
+            start_line = 1
+            end_line = 1000
+
         if not self.module:
-            logger.warning(f"Could not find module for file {self.file_path}")
-            return []
+            # --- 【核心修复】：为非代码文件（pom.xml等）提供基础行号支持 ---
+            logger.info(f"Adding raw line span {start_line}-{end_line} for non-module file {self.file_path}")
+            span_id = f"lines_{start_line}_{end_line}"
+            # 直接构造一个基础的 ContextSpan
+            new_span = ContextSpan(
+                span_id=span_id,
+                start_line=start_line,
+                end_line=end_line or start_line
+            )
+            self.spans.append(new_span)
+            return [span_id]
 
         logger.debug(f"Adding line span {start_line} - {end_line} to {self.file_path}")
         blocks = self.module.find_blocks_by_line_numbers(
@@ -1178,19 +1215,13 @@ class FileContext(BaseModel):
             yield self.get_context_file(file_path)
 
     def context_size(self):
-        if self._repo:
-            content = self.create_prompt(
-                show_span_ids=False,
-                show_line_numbers=True,
-                show_outcommented_code=True,
-                outcomment_code_comment="...",
-                only_signatures=False,
-            )
-            return count_tokens(content)
+        """计算整个 FileContext 容器内所有文件的总 Token 大小。"""
+        # FileContext 是一组 ContextFile 的集合
+        # 逻辑应该是：对所有子文件的 context_size() 进行求和
+        if not self._files:
+            return 0
 
-        # TODO: This doesnt give accure results. Will count tokens in the generated prompt instead
-        # sum(file.context_size() for file in self._files.values())
-        return 0
+        return sum(f.context_size() for f in self._files.values())
 
     def available_context_size(self):
         return self._max_tokens - self.context_size()
@@ -1573,7 +1604,6 @@ class FileContext(BaseModel):
         Returns:
             str: Summary string of test results
         """
-        from testbeds.schema import TestStatus
 
         all_results = []
         for test_file in self._test_files.values():
@@ -1592,7 +1622,6 @@ class FileContext(BaseModel):
         Returns:
             str: Formatted string containing details of failed tests
         """
-        from testbeds.schema import TestStatus
 
         test_result_strings = []
         for test_file in self._test_files.values():

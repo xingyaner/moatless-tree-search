@@ -327,34 +327,24 @@ class StructuredOutput(BaseModel):
             json_data: str | bytes | bytearray,
             **kwargs,
     ) -> "StructuredOutput":
-        """
-        【DeepSeek 协议适配器 v8.0 - 极限自愈版】
-        针对：DSML 标记污染、ViewCode 列表偏移、扁平结构、物理换行。
-        """
         import re
         import json
         import logging
 
         logger = logging.getLogger(__name__)
+        # 统一转码
         message = json_data.decode("utf-8") if isinstance(json_data, (bytes, bytearray)) else json_data
 
-        # --- 1. 强力清洗：抹除 DeepSeek 内部干扰标记 ---
-        # 移除类似 </｜DSML｜...>, <｜DSML｜...>, </｜...>, <｜...|等标记
-        message = re.sub(r'</?｜DSML｜\w+>', '', message)
-        message = re.sub(r'</?｜\w+｜\w+>', '', message)
-        message = re.sub(r'</?｜\w+>', '', message)
+        # 1. 强力清洗干扰标记
+        message = re.sub(r'<[^>]*｜[^>]*>', '', message)
+        message = re.sub(r'</?DSML[^>]*>', '', message)
         message = message.strip()
-
-        if not message or message == "{}":
-            raise ValueError("LLM response was empty after cleaning. Please provide a JSON action.")
 
         parsed_data = None
 
-        # --- 2. 贪婪提取：支持列表型和对象型 JSON ---
-        # 寻找第一个 { 或 [ 到最后一个 } 或 ]
+        # 2. 启发式 JSON 提取 (贪婪匹配)
         s_idx = re.search(r'[\{\[]', message)
         e_idx = message.rfind('}') if '}' in message else message.rfind(']')
-
         if s_idx and e_idx != -1 and e_idx > s_idx.start():
             potential_json = message[s_idx.start():e_idx + 1]
             try:
@@ -364,52 +354,52 @@ class StructuredOutput(BaseModel):
                                                                                                        '') + m.group(3),
                                         potential_json)
                 parsed_data = json.loads(potential_json, strict=False)
-            except json.JSONDecodeError:
+            except:
                 pass
 
-        if not parsed_data:
-            raise ValueError(f"Failed to find valid JSON in cleaned message: {message[:50]}...")
-
-        # --- 3. 逻辑重组 (The "Brain" of the Adapter) ---
-
-        # 如果模型回传的是一个列表 (对应证据 C: ViewCode 偏移)
+        # 3. 结构自愈逻辑
         if isinstance(parsed_data, list):
             if len(parsed_data) > 0 and "file_path" in parsed_data[0]:
-                parsed_data = {
-                    "action_type": "ViewCode",
-                    "action": {"files": parsed_data, "thoughts": "Exploring identified files."}
-                }
+                parsed_data = {"action_type": "ViewCode", "action": {"files": parsed_data}}
 
         if isinstance(parsed_data, dict):
-            # A. 扁平化结构自愈 (Missing action_type)
+            # 扁平转嵌套
             if "action_type" not in parsed_data:
                 target = parsed_data.get("action", parsed_data)
                 inferred = None
                 if any(k in target for k in ["path", "old_str", "new_str"]):
                     inferred = "StringReplace"
                 elif any(k in target for k in ["files", "file_path"]):
-                    inferred = "ViewCode"
+                    inferred = "SimpleViewCode"
                 elif "directory" in target:
                     inferred = "ListFiles"
                 elif "thoughts" in target:
                     inferred = "FuzzBuild"
+                if inferred: parsed_data = {"action_type": inferred, "action": target}
 
-                if inferred:
-                    parsed_data = {"action_type": inferred, "action": target}
+            # 针对 SimpleViewCode 习惯的单路径自愈
+            if parsed_data.get("action_type") == "ViewCode" or parsed_data.get("action_type") == "SimpleViewCode":
+                args = parsed_data.get("action", {})
+                if "file_path" in args and "files" not in args and parsed_data.get("action_type") == "ViewCode":
+                    args["files"] = [{"file_path": args.pop("file_path"), "start_line": 1, "end_line": 2000}]
+                    parsed_data["action"] = args
 
-            # B. ViewCode 列表强制对齐 (解决 files 字段缺失)
-            if parsed_data.get("action_type") == "ViewCode":
-                action_args = parsed_data.get("action", {})
-                if "file_path" in action_args and "files" not in action_args:
-                    logger.info("DeepSeek Adapter: Wrapping single file into list")
-                    action_args["files"] = [{"file_path": action_args.pop("file_path")}]
-                    parsed_data["action"] = action_args
-
-            # C. 兜底补全 thoughts
+            # 补全 thoughts
             if "action" in parsed_data and "thoughts" not in parsed_data["action"]:
-                parsed_data["action"]["thoughts"] = "Proceeding with current logic."
+                parsed_data["action"]["thoughts"] = "Analyzing identified path and proceeding."
 
-        # 4. 递归清理转义残留并执行原生验证
+        # --- 【修改 B 插入位置】：拦截由于“踌躇”导致的空解析 ---
+        if not parsed_data or not isinstance(parsed_data, dict):
+            if "[RESPONSE_END]" in message:
+                # 抛出带有示例的错误，强行引导重试
+                raise ValueError(
+                    "CRITICAL ERROR: Response received but NO valid JSON action was found. "
+                    "You MUST output a JSON object like: {\"action_type\": \"FuzzBuild\", \"action\": {\"thoughts\": \"...\"}}"
+                )
+            parsed_data = {}  # 兜底防止后续 _u 函数崩溃
+
+        # ----------------------------------------------------
+
         def _u(obj):
             if isinstance(obj, dict):
                 return {k: _u(v) for k, v in obj.items()}
@@ -420,6 +410,7 @@ class StructuredOutput(BaseModel):
             return obj
 
         return super().model_validate_json(json.dumps(_u(parsed_data)), **kwargs)
+
 
     def format_args_for_llm(self) -> str:
         """

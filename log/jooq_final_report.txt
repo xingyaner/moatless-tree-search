@@ -1,0 +1,8 @@
+============================================================
+🏁 FINAL BASELINE REPORT: jooq
+[RESULT]           ❌ FAILURE
+[SEARCH DEPTH]     14
+[REPAIR ROUNDS]    0
+[TOKEN USAGE]      364782
+[TIME COST]        24.52 minutes
+============================================================
