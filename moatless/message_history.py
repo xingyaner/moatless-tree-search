@@ -56,7 +56,7 @@ class MessageHistoryGenerator(BaseModel):
 
     @field_serializer("message_history_type")
     def serialize_message_history_type(
-        self, message_history_type: MessageHistoryType
+            self, message_history_type: MessageHistoryType
     ) -> str:
         return message_history_type.value
 
@@ -74,99 +74,92 @@ class MessageHistoryGenerator(BaseModel):
         previous_nodes = node.get_trajectory()[start_idx:]
         return generators[self.message_history_type](node, previous_nodes)
 
+        # 文件位置: moatless/message_history.py 完整函数替换
+
     def _generate_message_history(
-        self, node: Node, previous_nodes: List["Node"]
+            self, node: Node, previous_nodes: List["Node"]
     ) -> List[dict[str, Any]]:
         messages = []
-        tool_idx = 0
+        global_tool_idx = 0
         tokens = 0
 
-        for i, previous_node in enumerate(previous_nodes):
-            # Handle user message
+        for previous_node in previous_nodes:
+            # 1. User Message
             if previous_node.user_message:
-                message_content = [{"type": "text", "text": previous_node.user_message}]
-
-                if previous_node.artifact_changes:
-                    for change in previous_node.artifact_changes:
-                        artifact = previous_node.workspace.get_artifact_by_id(
-                            change.artifact_id
-                        )
-                        if artifact:
-                            message = f"{artifact.type} artifact: {artifact.id}"
-                            message_content.append({"type": "text", "text": message})
-                            message_content.append(artifact.to_prompt_format())
-
-                messages.append(
-                    ChatCompletionUserMessage(role="user", content=message_content)
-                )
+                messages.append({"role": "user", "content": previous_node.user_message})
                 tokens += count_tokens(previous_node.user_message)
 
-            tool_calls = []
-            tool_responses = []
-
+            # 2. Feedback
             if previous_node.feedback_data:
-                messages.append(
-                    ChatCompletionUserMessage(
-                        role="user", content=previous_node.feedback_data.feedback
-                    )
-                )
+                messages.append({"role": "user", "content": previous_node.feedback_data.feedback})
 
             if not previous_node.assistant_message and not previous_node.action_steps:
                 continue
 
+            # 3. 核心修复：预先对齐 Tool Calls 和 Tool Responses
+            current_node_tool_calls = []
+            current_node_tool_responses = []
+
             for action_step in previous_node.action_steps:
-                tool_idx += 1
-                tool_call_id = f"tool_{tool_idx}"
+                global_tool_idx += 1
+                t_id = f"tool_{global_tool_idx}"
 
-                exclude = None
-                if not self.thoughts_in_action:
-                    exclude = {"thoughts"}
-
-                tool_calls.append(
-                    {
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": action_step.action.name,
-                            "arguments": action_step.action.model_dump_json(
-                                exclude=exclude
-                            ),
-                        },
+                # 记录调用 (Assistant 必须包含此项)
+                exclude = {"thoughts"} if not self.thoughts_in_action else None
+                current_node_tool_calls.append({
+                    "id": t_id,
+                    "type": "function",
+                    "function": {
+                        "name": action_step.action.name,
+                        "arguments": action_step.action.model_dump_json(exclude=exclude),
                     }
-                )
+                })
 
-                tokens += count_tokens(
-                    action_step.action.model_dump_json(exclude=exclude)
-                )
+                # 记录响应 (Tool 角色必须指向上述 ID)
+                current_node_tool_responses.append({
+                    "role": "tool",
+                    "tool_call_id": t_id,
+                    "content": action_step.observation.message if (
+                                action_step.observation and action_step.observation.message) else "Action completed",
+                })
 
-                tool_responses.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": action_step.observation.message,
-                    }
-                )
+            # 4. 构造包含协议必需字段的 Assistant 消息
+            assistant_node = {
+                "role": "assistant",
+                # 即使没有文本，也要传 "" 占位
+                "content": previous_node.assistant_message if previous_node.assistant_message else ""
+            }
 
-                tokens += count_tokens(action_step.observation.message)
+            # 如果有工具调用，必须在这里显式包含
+            if current_node_tool_calls:
+                assistant_node["tool_calls"] = current_node_tool_calls
 
-            assistant_message = {"role": "assistant"}
+            # 找回思维链 (Reasoning Content)
+            reasoning = None
+            if previous_node.action_steps and previous_node.action_steps[-1].completion:
+                resp = previous_node.action_steps[-1].completion.response
+                if resp and "choices" in resp:
+                    reasoning = resp["choices"][0]["message"].get("reasoning_content")
 
-            if tool_calls:
-                assistant_message["tool_calls"] = tool_calls
+            if not reasoning and previous_node.completions:
+                for comp in previous_node.completions.values():
+                    if comp.response and "choices" in comp.response:
+                        reasoning = comp.response["choices"][0]["message"].get("reasoning_content")
+                        if reasoning: break
 
-            if previous_node.assistant_message:
-                assistant_message["content"] = previous_node.assistant_message
-                tokens += count_tokens(previous_node.assistant_message)
+            if reasoning:
+                assistant_node["reasoning_content"] = reasoning
 
-            messages.append(assistant_message)
-            messages.extend(tool_responses)
+            # 严格按照 [Assistant(tool_calls)] -> [Tool] 顺序排列
+            messages.append(assistant_node)
+            messages.extend(current_node_tool_responses)
 
-        logger.info(f"Generated {len(messages)} messages with {tokens} tokens")
-
+        logger.info(f"Generated {len(messages)} history messages for DeepSeek Reasoner.")
         return messages
 
+
     def _generate_compact_message_history(
-        self, node: Node, previous_nodes: List["Node"]
+            self, node: Node, previous_nodes: List["Node"]
     ) -> List[dict[str, Any]]:
         messages = [
             ChatCompletionUserMessage(role="user", content=node.get_root().message)
@@ -225,7 +218,7 @@ class MessageHistoryGenerator(BaseModel):
         return messages
 
     def _generate_react_history(
-        self, node: "Node", previous_nodes: List["Node"]
+            self, node: "Node", previous_nodes: List["Node"]
     ) -> List[AllMessageValues]:
         messages = [
             ChatCompletionUserMessage(role="user", content=node.get_root().message)
@@ -267,7 +260,7 @@ class MessageHistoryGenerator(BaseModel):
         return messages
 
     def _generate_summary_history(
-        self, node: Node, previous_nodes: List[Node]
+            self, node: Node, previous_nodes: List[Node]
     ) -> List[AllMessageValues]:
         formatted_history: List[str] = []
         counter = 0
@@ -292,9 +285,9 @@ class MessageHistoryGenerator(BaseModel):
 
                 if previous_node.observation:
                     if (
-                        hasattr(previous_node.observation, "summary")
-                        and previous_node.observation.summary
-                        and i < len(previous_nodes) - 1
+                            hasattr(previous_node.observation, "summary")
+                            and previous_node.observation.summary
+                            and i < len(previous_nodes) - 1
                     ):
                         formatted_state += (
                             f"\n\nObservation: {previous_node.observation.summary}"
@@ -404,7 +397,7 @@ class MessageHistoryGenerator(BaseModel):
                                 file_path
                             )
                             if context_file and (
-                                context_file.span_ids or context_file.show_all_spans
+                                    context_file.span_ids or context_file.show_all_spans
                             ):
                                 shown_files.add(context_file.file_path)
                                 observation = context_file.to_prompt(
@@ -422,8 +415,8 @@ class MessageHistoryGenerator(BaseModel):
                         observation_str = (
                             action_step.observation.summary
                             if self.include_file_context
-                            and hasattr(action_step.observation, "summary")
-                            and action_step.observation.summary
+                               and hasattr(action_step.observation, "summary")
+                               and action_step.observation.summary
                             else action_step.observation.message
                             if action_step.observation
                             else "No output found."
@@ -448,14 +441,14 @@ class MessageHistoryGenerator(BaseModel):
 
                 # Handle file context for non-ViewCode actions
                 if (
-                    self.include_file_context
-                    and previous_node.action.name != "ViewCode"
+                        self.include_file_context
+                        and previous_node.action.name != "ViewCode"
                 ):
                     files_to_show = set()
                     has_edits = False
                     for context_file in previous_node.file_context.get_context_files():
                         if (
-                            context_file.was_edited or context_file.was_viewed
+                                context_file.was_edited or context_file.was_viewed
                         ) and context_file.file_path not in shown_files:
                             files_to_show.add(context_file.file_path)
                         if context_file.was_edited:
@@ -521,14 +514,14 @@ class MessageHistoryGenerator(BaseModel):
 
                     # Add test results only if status changed or first occurrence
                     if (
-                        node.file_context.has_runtime
-                        and previous_node.observation
-                        and previous_node.observation.properties.get("diff")
+                            node.file_context.has_runtime
+                            and previous_node.observation
+                            and previous_node.observation.properties.get("diff")
                     ):
                         current_test_status = node.file_context.get_test_status()
                         if (
-                            last_test_status is None
-                            or current_test_status != last_test_status
+                                last_test_status is None
+                                or current_test_status != last_test_status
                         ):
                             if node.file_context.has_test_patch():
                                 thoughts = "<thoughts>Run the updated tests to verify the changes.</thoughts>"

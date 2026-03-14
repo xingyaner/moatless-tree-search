@@ -1,50 +1,37 @@
 import hashlib
 import json
 import logging
-from typing import Optional, Any, Union, Self, ClassVar
-
+from typing import Optional, Any, Union, ClassVar, List, Dict
+from typing_extensions import Self
 from docstring_parser import parse
 from instructor.utils import classproperty
 from pydantic import BaseModel, model_validator, Field, ValidationError
-
 logger = logging.getLogger(__name__)
-
 
 class Message(BaseModel):
     role: str = Field(..., description="The role of the sender")
-    content: Optional[str] = Field(None, description="The message content")
-
+    # 核心修复：强制 content 不为 None，满足 DeepSeek 协议
+    content: Optional[Union[str, List[Dict[str, Any]]]] = Field("", description="The message content")
+    reasoning_content: Optional[str] = Field(None, description="The reasoning process")
 
 class ToolCall(BaseModel):
     name: str = Field(..., description="The name of the tool being called")
-    type: Optional[str] = Field(None, description="The type of tool call")
-    input: Optional[dict[str, Any]] = Field(
-        None, description="The input parameters for the tool"
-    )
-
-    def __post_init__(self):
-        # Ensure name is always a string
-        self.name = str(self.name)
-
+    type: Optional[str] = Field("function", description="The type of tool call")
+    input: Optional[Dict[str, Any]] = Field(None, description="The input parameters for the tool")
 
 class AssistantMessage(Message):
     role: str = Field("assistant", description="The role of the assistant")
-    content: Optional[str] = Field(None, description="The assistant's message content")
-    tool_call: Optional[ToolCall] = Field(
-        None, description="Tool call made by the assistant"
-    )
+    content: Optional[str] = Field("", description="The assistant's message content")
+    tool_call: Optional[ToolCall] = Field(None, description="Legacy single tool call")
+    # 核心修复：显式支持 tool_calls 列表以配合 role: tool 消息
+    tool_calls: Optional[List[Dict[str, Any]]] = Field(None, description="Multiple tool calls")
+    reasoning_content: Optional[str] = Field(None, description="The reasoning process")
 
     @property
     def tool_call_id(self) -> Optional[str]:
-        """Generate a deterministic tool call ID based on the tool call content"""
-        if not self.tool_call:
-            return None
-
-        # Create a string combining name and input for hashing
+        if not self.tool_call: return None
         tool_str = f"{str(self.tool_call.name)}:{json.dumps(self.tool_call.input, sort_keys=True)}"
-        # Generate SHA-256 hash and take first 8 characters
-        hash_id = hashlib.sha256(tool_str.encode()).hexdigest()[:8]
-        return f"call_{hash_id}"
+        return f"call_{hashlib.sha256(tool_str.encode()).hexdigest()[:8]}"
 
 
 class UserMessage(Message):
@@ -59,66 +46,23 @@ class Usage(BaseModel):
     cached_tokens: int = 0
 
     @classmethod
-    def from_completion_response(
-        cls, completion_response: dict | BaseModel, model: str
-    ) -> Union["Usage", None]:
-        if isinstance(completion_response, BaseModel) and hasattr(
-            completion_response, "usage"
-        ):
+    def from_completion_response(cls, completion_response: dict | BaseModel, model: str) -> Union["Usage", None]:
+        if isinstance(completion_response, BaseModel) and hasattr(completion_response, "usage"):
             usage = completion_response.usage.model_dump()
         elif isinstance(completion_response, dict) and "usage" in completion_response:
             usage = completion_response["usage"]
         else:
-            logger.warning(
-                f"No usage info available in completion response: {completion_response}"
-            )
             return None
 
-        logger.debug(f"Usage: {json.dumps(usage, indent=2)}")
-
         prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens", 0)
+        completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens", 0)
+        cached_tokens = usage.get("prompt_cache_hit_tokens", 0)
 
-        if usage.get("cache_creation_input_tokens"):
-            prompt_tokens += usage["cache_creation_input_tokens"]
-
-        completion_tokens = usage.get("completion_tokens") or usage.get(
-            "output_tokens", 0
-        )
-
-        if usage.get("prompt_cache_hit_tokens"):
-            cached_tokens = usage["prompt_cache_hit_tokens"]
-        elif usage.get("cache_read_input_tokens"):
-            cached_tokens = usage["cache_read_input_tokens"]
-        else:
-            cached_tokens = 0
-
+        import litellm
         try:
-            import litellm
-
-            cost = litellm.completion_cost(
-                completion_response=completion_response, model=model
-            )
-        except Exception:
-            # If cost calculation fails, fall back to calculating it manually
-            try:
-                from litellm import cost_per_token, NotFoundError
-
-                prompt_cost, completion_cost = cost_per_token(
-                    model=model,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                )
-                cost = prompt_cost + completion_cost
-            except NotFoundError as e:
-                logger.debug(
-                    f"Failed to calculate cost for completion response: {completion_response}. Error: {e}"
-                )
-                cost = 0
-            except Exception as e:
-                logger.debug(
-                    f"Failed to calculate cost for completion response: {completion_response}. Error: {e}"
-                )
-                cost = 0
+            cost = litellm.completion_cost(completion_response=completion_response, model=model)
+        except:
+            cost = 0
 
         return cls(
             completion_cost=cost,
@@ -128,17 +72,11 @@ class Usage(BaseModel):
         )
 
     def __add__(self, other: "Usage") -> "Usage":
-        # Get completion cost, defaulting to 0 if not available
-        other_cost = getattr(other, "completion_cost", 0)
-        other_completion = getattr(other, "completion_tokens", 0)
-        other_prompt = getattr(other, "prompt_tokens", 0)
-        other_cached = getattr(other, "cached_tokens", 0)
-
         return Usage(
-            completion_cost=self.completion_cost + other_cost,
-            completion_tokens=self.completion_tokens + other_completion,
-            prompt_tokens=self.prompt_tokens + other_prompt,
-            cached_tokens=self.cached_tokens + other_cached,
+            completion_cost=self.completion_cost + getattr(other, "completion_cost", 0),
+            completion_tokens=self.completion_tokens + getattr(other, "completion_tokens", 0),
+            prompt_tokens=self.prompt_tokens + getattr(other, "prompt_tokens", 0),
+            cached_tokens=self.cached_tokens + getattr(other, "cached_tokens", 0),
         )
 
     def __str__(self) -> str:
@@ -385,65 +323,103 @@ class StructuredOutput(BaseModel):
 
     @classmethod
     def model_validate_json(
-        cls,
-        json_data: str | bytes | bytearray,
-        **kwarg,
-    ) -> Self:
-        if not json_data:
-            raise ValidationError("Message is empty")
+            cls,
+            json_data: str | bytes | bytearray,
+            **kwargs,
+    ) -> "StructuredOutput":
+        """
+        【DeepSeek 协议适配器 v8.0 - 极限自愈版】
+        针对：DSML 标记污染、ViewCode 列表偏移、扁平结构、物理换行。
+        """
+        import re
+        import json
+        import logging
 
-        try:
-            parsed_data = json.loads(json_data, strict=False)
+        logger = logging.getLogger(__name__)
+        message = json_data.decode("utf-8") if isinstance(json_data, (bytes, bytearray)) else json_data
 
-            def unescape_values(obj):
-                if isinstance(obj, dict):
-                    return {k: unescape_values(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [unescape_values(v) for v in obj]
-                elif isinstance(obj, str) and "\\" in obj:
-                    return obj.encode().decode("unicode_escape")
-                return obj
+        # --- 1. 强力清洗：抹除 DeepSeek 内部干扰标记 ---
+        # 移除类似 </｜DSML｜...>, <｜DSML｜...>, </｜...>, <｜...|等标记
+        message = re.sub(r'</?｜DSML｜\w+>', '', message)
+        message = re.sub(r'</?｜\w+｜\w+>', '', message)
+        message = re.sub(r'</?｜\w+>', '', message)
+        message = message.strip()
 
-            cleaned_data = unescape_values(parsed_data)
-            cleaned_json = json.dumps(cleaned_data)
-            return super().model_validate_json(cleaned_json, **kwarg)
+        if not message or message == "{}":
+            raise ValueError("LLM response was empty after cleaning. Please provide a JSON action.")
 
-        except (json.JSONDecodeError, ValidationError) as e:
-            # If direct parsing fails, try more aggressive cleanup
-            logger.warning(f"Initial JSON parse failed, attempting alternate cleanup")
+        parsed_data = None
 
-            message = json_data
+        # --- 2. 贪婪提取：支持列表型和对象型 JSON ---
+        # 寻找第一个 { 或 [ 到最后一个 } 或 ]
+        s_idx = re.search(r'[\{\[]', message)
+        e_idx = message.rfind('}') if '}' in message else message.rfind(']')
 
-            cleaned_message = "".join(
-                char for char in message if ord(char) >= 32 or char in "\n\r\t"
-            )
-            if cleaned_message != message:
-                logger.info(
-                    f"parse_json() Cleaned control chars: {repr(message)} -> {repr(cleaned_message)}"
-                )
-            message = cleaned_message
+        if s_idx and e_idx != -1 and e_idx > s_idx.start():
+            potential_json = message[s_idx.start():e_idx + 1]
+            try:
+                # 预处理物理换行
+                potential_json = re.sub(r'(":?\s*")([\s\S]*?)("[\s\n\r]*[,}])',
+                                        lambda m: m.group(1) + m.group(2).replace('\n', '\\n').replace('\r',
+                                                                                                       '') + m.group(3),
+                                        potential_json)
+                parsed_data = json.loads(potential_json, strict=False)
+            except json.JSONDecodeError:
+                pass
 
-            # Replace None with null
-            message = message.replace(": None", ": null").replace(":None", ":null")
+        if not parsed_data:
+            raise ValueError(f"Failed to find valid JSON in cleaned message: {message[:50]}...")
 
-            # Extract JSON and try parsing again
-            message, all_jsons = extract_json_from_message(message)
-            if all_jsons:
-                if len(all_jsons) > 1:
-                    logger.warning(
-                        f"Found multiple JSON objects, using the first one. All found: {all_jsons}"
-                    )
-                message = all_jsons[0]
+        # --- 3. 逻辑重组 (The "Brain" of the Adapter) ---
 
-            # Normalize line endings
-            if isinstance(message, str):
-                message = message.replace("\r\n", "\n").replace("\r", "\n")
+        # 如果模型回传的是一个列表 (对应证据 C: ViewCode 偏移)
+        if isinstance(parsed_data, list):
+            if len(parsed_data) > 0 and "file_path" in parsed_data[0]:
+                parsed_data = {
+                    "action_type": "ViewCode",
+                    "action": {"files": parsed_data, "thoughts": "Exploring identified files."}
+                }
 
-            logger.debug(f"Final message to validate: {repr(message)}")
+        if isinstance(parsed_data, dict):
+            # A. 扁平化结构自愈 (Missing action_type)
+            if "action_type" not in parsed_data:
+                target = parsed_data.get("action", parsed_data)
+                inferred = None
+                if any(k in target for k in ["path", "old_str", "new_str"]):
+                    inferred = "StringReplace"
+                elif any(k in target for k in ["files", "file_path"]):
+                    inferred = "ViewCode"
+                elif "directory" in target:
+                    inferred = "ListFiles"
+                elif "thoughts" in target:
+                    inferred = "FuzzBuild"
 
-            return super().model_validate_json(
-                message if isinstance(message, str) else json.dumps(message), **kwarg
-            )
+                if inferred:
+                    parsed_data = {"action_type": inferred, "action": target}
+
+            # B. ViewCode 列表强制对齐 (解决 files 字段缺失)
+            if parsed_data.get("action_type") == "ViewCode":
+                action_args = parsed_data.get("action", {})
+                if "file_path" in action_args and "files" not in action_args:
+                    logger.info("DeepSeek Adapter: Wrapping single file into list")
+                    action_args["files"] = [{"file_path": action_args.pop("file_path")}]
+                    parsed_data["action"] = action_args
+
+            # C. 兜底补全 thoughts
+            if "action" in parsed_data and "thoughts" not in parsed_data["action"]:
+                parsed_data["action"]["thoughts"] = "Proceeding with current logic."
+
+        # 4. 递归清理转义残留并执行原生验证
+        def _u(obj):
+            if isinstance(obj, dict):
+                return {k: _u(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_u(v) for v in obj]
+            elif isinstance(obj, str):
+                return obj.replace('\\"', '"')
+            return obj
+
+        return super().model_validate_json(json.dumps(_u(parsed_data)), **kwargs)
 
     def format_args_for_llm(self) -> str:
         """

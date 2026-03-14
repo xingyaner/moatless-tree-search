@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 class ToolCallCompletionModel(CompletionModel):
     def create_completion(
-        self,
-        messages: List[dict],
-        system_prompt: str,
-        response_model: List[type[StructuredOutput]] | type[StructuredOutput],
+            self,
+            messages: List[dict],
+            system_prompt: str,
+            response_model: List[type[StructuredOutput]] | type[StructuredOutput],
     ) -> CompletionResponse:
         tools = []
 
@@ -64,13 +64,37 @@ class ToolCallCompletionModel(CompletionModel):
                 )
 
                 if not llm_completion_response or not llm_completion_response.choices:
-                    raise CompletionRuntimeError(
-                        "No completion response or choices returned"
-                    )
+                    raise CompletionRuntimeError("No choices returned")
 
-                total_usage += Usage.from_completion_response(
-                    llm_completion_response, self.model
-                )
+                # 获取原始消息对象
+                raw_msg = llm_completion_response.choices[0].message
+
+                # --- 【DeepSeek-Chat 协议鲁棒性处理】 ---
+                # 1. 强制空值占位
+                content = raw_msg.content if raw_msg.content is not None else ""
+
+                # 2. 构造符合协议的消息节点
+                assistant_entry = {
+                    "role": "assistant",
+                    "content": content
+                }
+
+                # 保留思维链（如果是 Chat 模型返回了 CoT）
+                reasoning = getattr(raw_msg, 'reasoning_content', None)
+                if reasoning:
+                    assistant_entry["reasoning_content"] = reasoning
+
+                # 必须将 tool_calls 写回消息历史，否则后续 role: tool 消息会因找不到来源而报错
+                if raw_msg.tool_calls:
+                    assistant_entry["tool_calls"] = [
+                        tc.model_dump() if hasattr(tc, 'model_dump') else tc
+                        for tc in raw_msg.tool_calls
+                    ]
+
+                messages.append(assistant_entry)
+
+                # 后续解析逻辑保持原样
+                total_usage += Usage.from_completion_response(llm_completion_response, self.model)
 
                 content = llm_completion_response.choices[0].message.content
 
@@ -132,9 +156,7 @@ class ToolCallCompletionModel(CompletionModel):
                     flags=list(flags),
                 )
 
-                return CompletionResponse.create(
-                    text=content, output=response_objects, completion=completion
-                )
+                return CompletionResponse.create(text=content, output=response_objects, completion=completion)
 
             except (ValidationError, ValueError) as e:
                 logger.warning(

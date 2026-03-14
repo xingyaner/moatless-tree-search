@@ -1,0 +1,15 @@
+- project: jooq
+  language: jvm
+  error_time: '2025-11-26'
+  last_success_time: ''
+  oss-fuzz_sha: 8c75bf08fabff214da2e110309c7be332b3803eb
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-bd32c0ee-34ca-42c7-8128-2eeff7e23b67.txt
+  software_repo_url: https://github.com/jOOQ/jOOQ.git
+  software_sha: 1077c69457952ec296ba6614338b0d9b2275e9a2
+  engine: libfuzzer
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: 8b23955caaed68d9b1d248a868633c63e4b12667cbe61f7062cf42e986a95905
+  error_category: RC13
+  fixed_state: 'no'
+

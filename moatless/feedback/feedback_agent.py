@@ -16,11 +16,10 @@ from moatless.schema import MessageHistoryType
 
 logger = logging.getLogger(__name__)
 
-
 class FeedbackResponse(StructuredOutput):
     """Schema for feedback response"""
 
-    name: str = "provide_feedback"
+    feedback_name: str = "provide_feedback"   # 重命名
 
     analysis: str = Field(
         ...,
@@ -38,7 +37,7 @@ class FeedbackResponse(StructuredOutput):
         """Provide schema in format expected by Anthropic's tool calling"""
         return {
             "type": "custom",
-            "name": "provide_feedback",
+            "name": cls.feedback_name,   # 使用新字段名
             "description": "Provide feedback on the current state",
             "input_schema": {
                 "type": "object",
@@ -66,6 +65,55 @@ class FeedbackResponse(StructuredOutput):
             "role": self.role if hasattr(self, "role") else "assistant",
             "content": self.content if hasattr(self, "content") else str(self),
         }
+# class FeedbackResponse(StructuredOutput):
+#     """Schema for feedback response"""
+#
+#     name: str = "provide_feedback"
+#
+#     analysis: str = Field(
+#         ...,
+#         description="Brief analysis of parent state and lessons from alternative attempts",
+#     )
+#     feedback: str = Field(
+#         ..., description="Clear, actionable guidance for your next action"
+#     )
+#     suggested_node_id: Optional[int] = Field(
+#         None, description="ID of the node that should be expanded next (optional)"
+#     )
+#
+#     @classmethod
+#     def anthropic_schema(cls) -> Dict[str, Any]:
+#         """Provide schema in format expected by Anthropic's tool calling"""
+#         return {
+#             "type": "custom",
+#             "name": "provide_feedback",
+#             "description": "Provide feedback on the current state",
+#             "input_schema": {
+#                 "type": "object",
+#                 "properties": {
+#                     "analysis": {
+#                         "type": "string",
+#                         "description": "Brief analysis of parent state and lessons from alternative attempts",
+#                     },
+#                     "feedback": {
+#                         "type": "string",
+#                         "description": "Clear, actionable guidance for your next action",
+#                     },
+#                     "suggested_node_id": {
+#                         "type": ["integer", "null"],
+#                         "description": "ID of the node that should be expanded next (optional)",
+#                     },
+#                 },
+#                 "required": ["analysis", "feedback"],
+#             },
+#         }
+#
+#     def to_dict(self) -> Dict[str, Any]:
+#         """Convert Message objects to dictionaries"""
+#         return {
+#             "role": self.role if hasattr(self, "role") else "assistant",
+#             "content": self.content if hasattr(self, "content") else str(self),
+#         }
 
 
 class FeedbackAgent(FeedbackGenerator):

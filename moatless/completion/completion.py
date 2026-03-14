@@ -3,7 +3,7 @@ import logging
 import os
 from enum import Enum
 from textwrap import dedent
-from typing import Optional, Union, List, Any
+from typing import Optional, Union, List, Any, Dict
 
 import litellm
 import tenacity
@@ -17,6 +17,14 @@ from pydantic import BaseModel, Field, model_validator, ValidationError
 
 from moatless.completion.model import Completion, StructuredOutput
 from moatless.exceptions import CompletionRejectError, CompletionRuntimeError
+
+# =================================================================
+# --- 硬编码 API 配置区 (Hardcoded API Config) ---
+# =================================================================
+# 已经按照您的指令填入 DeepSeek API 信息
+DEFAULT_API_KEY = "sk-"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+# =================================================================
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +44,8 @@ class CompletionResponse(BaseModel):
     completion: Optional[Completion] = Field(default=None)
 
     @classmethod
-    def create(
-        cls,
-        text: str | None = None,
-        output: List[StructuredOutput] | StructuredOutput | None = None,
-        completion: Completion | None = None,
-    ) -> "CompletionResponse":
+    def create(cls, text: str | None = None, output: List[StructuredOutput] | StructuredOutput | None = None,
+               completion: Completion | None = None) -> "CompletionResponse":
         if isinstance(output, StructuredOutput):
             outputs = [output]
         elif isinstance(output, list):
@@ -49,9 +53,7 @@ class CompletionResponse(BaseModel):
         else:
             outputs = None
 
-        return cls(
-            text_response=text, structured_outputs=outputs, completion=completion
-        )
+        return cls(text_response=text, structured_outputs=outputs, completion=completion)
 
     @property
     def structured_output(self) -> Optional[StructuredOutput]:
@@ -69,216 +71,146 @@ class CompletionResponse(BaseModel):
 class CompletionModel(BaseModel):
     model: str = Field(..., description="The model to use for completion")
     temperature: float = Field(0.0, description="The temperature to use for completion")
-    max_tokens: int = Field(
-        2000, description="The maximum number of tokens to generate"
-    )
-    timeout: float = Field(
-        120.0, description="The timeout in seconds for completion requests"
-    )
-    model_base_url: Optional[str] = Field(
-        default=None, description="The base URL for the model API"
-    )
-    model_api_key: Optional[str] = Field(
-        default=None, description="The API key for the model", exclude=True
-    )
-    response_format: Optional[LLMResponseFormat] = Field(
-        None, description="The response format expected from the LLM"
-    )
-    stop_words: Optional[list[str]] = Field(
-        default=None, description="The stop words to use for completion"
-    )
-    metadata: Optional[dict] = Field(
-        default=None, description="Additional metadata for the completion model"
-    )
-    thoughts_in_action: bool = Field(
-        default=False,
-        description="Whether to include thoughts in the action or in the message",
-    )
+    max_tokens: int = Field(2000, description="The maximum number of tokens to generate")
+    timeout: float = Field(120.0, description="The timeout in seconds for completion requests")
+    # 默认值直接指向硬编码的 Base URL
+    model_base_url: Optional[str] = Field(default=DEFAULT_BASE_URL, description="The base URL for the model API")
+    # 默认值直接指向硬编码的 API Key
+    model_api_key: Optional[str] = Field(default=DEFAULT_API_KEY, description="The API key for the model", exclude=True)
+    response_format: Optional[LLMResponseFormat] = Field(None, description="The response format expected from the LLM")
+    stop_words: Optional[list[str]] = Field(default=None, description="The stop words to use for completion")
+
+    metadata: Optional[dict] = Field(default=None, description="Additional metadata for the completion model")
+    enable_thinking: bool = Field(default=False, description="Whether to enable DeepSeek thinking mode")
+    thoughts_in_action: bool = Field(default=False,
+                                     description="Whether to include thoughts in the action or in the message", )
 
     def clone(self, **kwargs) -> "CompletionModel":
-        """Create a copy of the completion model with optional parameter overrides.
-
-        Args:
-            **kwargs: Parameters to override in the cloned model
-
-        Returns:
-            A new CompletionModel instance with the specified overrides
-        """
+        """Create a copy of the completion model with optional parameter overrides."""
         model_data = self.model_dump()
         model_data.update(kwargs)
+        # 确保 clone 时也保留 API key
+        if "model_api_key" not in kwargs:
+            model_data["model_api_key"] = self.model_api_key
         return CompletionModel.model_validate(model_data)
 
-    def create_completion(
-        self,
-        messages: List[dict],
-        system_prompt: str,
-        response_model: List[type[StructuredOutput]] | type[StructuredOutput],
-    ) -> CompletionResponse:
+    def create_completion(self, messages: List[dict], system_prompt: str,
+                          response_model: List[type[StructuredOutput]] | type[StructuredOutput]) -> CompletionResponse:
         if not response_model:
             raise CompletionRuntimeError(f"Response model is required for completion")
 
         if isinstance(response_model, list) and len(response_model) > 1:
-            avalabile_actions = [
-                action for action in response_model if hasattr(action, "name")
-            ]
+            avalabile_actions = [a for a in response_model if hasattr(a, "name")]
             if not avalabile_actions:
                 raise CompletionRuntimeError(f"No actions found in {response_model}")
 
             class TakeAction(StructuredOutput):
                 action: Union[tuple(response_model)] = Field(...)
-                action_type: str = Field(
-                    ..., description="The type of action being taken"
-                )
+                action_type: str = Field(..., description="The type of action being taken")
 
                 @model_validator(mode="before")
                 def validate_action(cls, data: dict) -> dict:
-                    if not isinstance(data, dict):
-                        raise ValidationError("Expected dictionary input")
-
+                    if not isinstance(data, dict): return data
                     action_type = data.get("action_type")
-                    if not action_type:
-                        return data
-
-                    # Find the correct action class based on action_type
-                    action_class = next(
-                        (
-                            action
-                            for action in avalabile_actions
-                            if action.name == action_type
-                        ),
-                        None,
-                    )
-                    if not action_class:
-                        action_names = [action.name for action in avalabile_actions]
-                        raise ValidationError(
-                            f"Unknown action type: {action_type}. Available actions: {', '.join(action_names)}"
-                        )
-
-                    # Validate the action data using the specific action class
-                    action_data = data.get("action")
-                    if not action_data:
-                        raise ValidationError("Action data is required")
-
-                    data["action"] = action_class.model_validate(action_data)
+                    if not action_type: return data
+                    action_class = next((a for a in avalabile_actions if a.name == action_type), None)
+                    if not action_class: raise ValidationError(f"Unknown action {action_type}")
+                    data["action"] = action_class.model_validate(data.get("action"))
                     return data
 
             response_model = TakeAction
 
-        system_prompt += dedent(f"""\n# Response format
-        You must respond with only a JSON object that match the following json_schema:\n
-
-        {json.dumps(response_model.model_json_schema(), indent=2, ensure_ascii=False)}
-
-        Make sure to return an instance of the JSON, not the schema itself.""")
-
-        messages.insert(0, {"role": "system", "content": system_prompt})
+        # --- 【关键修正 1】防止 System 消息重复插入 ---
+        current_messages = messages.copy()
+        if not current_messages or current_messages[0].get("role") != "system":
+            full_system = system_prompt + dedent(
+                f"""\n# Response format\nYou must respond with only a JSON object matching the schema:\n{json.dumps(response_model.model_json_schema(), indent=2, ensure_ascii=False)}\n""")
+            current_messages.insert(0, {"role": "system", "content": full_system})
 
         retries = tenacity.Retrying(
-            retry=tenacity.retry_if_not_exception_type(
-                (APIError, BadRequestError, NotFoundError, AuthenticationError)
-            ),
+            retry=tenacity.retry_if_not_exception_type((APIError, BadRequestError, NotFoundError, AuthenticationError)),
             stop=tenacity.stop_after_attempt(3),
         )
 
         def _do_completion():
             completion_response = None
-
             try:
-                completion_response = self._litellm_base_completion(
-                    messages=messages, response_format={"type": "json_object"}
-                )
+                # 开启 DeepSeek 官方 JSON 模式
+                completion_response = self._litellm_base_completion(messages=current_messages,
+                                                                    response_format={"type": "json_object"})
 
                 if not completion_response or not completion_response.choices:
-                    raise CompletionRuntimeError(
-                        "No completion response or choices returned"
-                    )
+                    raise CompletionRuntimeError("No completion response or choices returned")
 
-                if isinstance(
-                    completion_response.choices[0].message.content, BaseModel
-                ):
-                    assistant_message = completion_response.choices[
-                        0
-                    ].message.content.model_dump()
-                else:
-                    assistant_message = completion_response.choices[0].message.content
+                msg_obj = completion_response.choices[0].message
+                content = msg_obj.content if msg_obj.content is not None else ""
+                reasoning = getattr(msg_obj, 'reasoning_content', None) or ""
 
-                if not assistant_message:
-                    raise CompletionRuntimeError("Empty response from model")
+                # --- 合并思维链和正文，确保 JSON 不被遗漏 ---
+                combined_input = f"{reasoning}\n{content}".strip()
 
-                messages.append({"role": "assistant", "content": assistant_message})
+                # --- 【新增：证据拦截打印】 ---
+                print("\n" + "!"*30 + " [RAW LLM DATA START] " + "!"*30)
+                print(f"MODEL: {self.model}")
+                print(f"REASONING LENGTH: {len(reasoning)}")
+                print(f"CONTENT LENGTH: {len(content)}")
+                print(f"RAW COMBINED INPUT:\n{combined_input}")
+                print("!"*30 + " [RAW LLM DATA END] " + "!"*30 + "\n")
 
-                response = response_model.model_validate_json(assistant_message)
+                assistant_history_entry = {"role": "assistant", "content": content}
+                if reasoning:
+                    assistant_history_entry["reasoning_content"] = reasoning
+                current_messages.append(assistant_history_entry)
 
-                completion = Completion.from_llm_completion(
-                    input_messages=messages,
-                    completion_response=completion_response,
-                    model=self.model,
-                )
+                # 将合并后的文本交给增强型解析器，如果为空则传 "{}" 触发解析器内部的重试诱导
+                response = response_model.model_validate_json(combined_input if combined_input else "{}")
+                completion_obj = Completion.from_llm_completion(input_messages=current_messages,
+                                                                completion_response=completion_response,
+                                                                model=self.model)
+
                 if hasattr(response, "action"):
-                    return CompletionResponse.create(
-                        output=response.action, completion=completion
-                    )
+                    return CompletionResponse.create(output=response.action, completion=completion_obj)
+                return CompletionResponse.create(output=response, completion=completion_obj)
 
-                return CompletionResponse.create(output=response, completion=completion)
+            except (ValidationError, json.JSONDecodeError, ValueError) as e:
+                # 这就是闭环的关键：将解析器的报错发回给 LLM
+                feedback_msg = f"FORMAT ERROR: {str(e)}"
+                logger.warning(f"Validation failed: {feedback_msg}. Retrying with feedback.")
 
-            except (ValidationError, json.JSONDecodeError) as e:
-                logger.warning(
-                    f"Completion attempt failed with error: {e}. Will retry."
-                )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"The response was invalid. Fix the errors, exceptions found\n{e}",
-                    }
-                )
-                raise CompletionRejectError(
-                    message=str(e),
-                    last_completion=completion_response,
-                    messages=messages,
-                ) from e
-            except Exception as e:
-                logger.exception(
-                    f"Completion attempt failed with error: {e}. Will retry."
-                )
-                raise CompletionRuntimeError(
-                    f"Failed to get completion response: {e}",
-                )
+                # 更新消息历史，让模型知道哪里错了
+                current_messages.append({"role": "user", "content": feedback_msg})
+
+                # 重新抛出，触发 tenacity 重试
+                raise CompletionRejectError(message=str(e), last_completion=completion_response,
+                                            messages=current_messages) from e
+
 
         try:
             return retries(_do_completion)
         except tenacity.RetryError as e:
             raise e.reraise()
 
-    def _litellm_base_completion(
-        self,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-        tool_choice: str | None = None,
-        response_format: dict | None = None,
-    ) -> Any:
-        """Base method for making litellm completion calls with common parameters.
-
-        Args:
-            messages: List of message dictionaries
-            tools: Optional list of tool definitions for function calling
-            tool_choice: Optional tool choice configuration
-            response_format: Optional response format configuration
-
-        Returns:
-            The completion response from litellm
-        """
+    def _litellm_base_completion(self, messages: list[dict], **kwargs) -> Any:
+        # 允许 litellm 自动处理不同模型的参数映射
         litellm.drop_params = True
 
         @tenacity.retry(
             stop=tenacity.stop_after_attempt(2),
-            wait=tenacity.wait_exponential(multiplier=3),
-            retry=tenacity.retry_if_exception_type(Exception),
+            wait=tenacity.wait_exponential(multiplier=2),
             reraise=True,
             before_sleep=lambda retry_state: logger.warning(
                 f"Retrying litellm completion after error: {retry_state.outcome.exception()}"
             ),
         )
-        def _do_completion():
+        def _do_call():
+            # 显式初始化 extra_body 为 None，防止 NameError
+            # 如果未来需要再次开启 Reasoner 的思考模式，可以在此进行条件赋值
+            extra_body = None
+
+            # 如果模型是 reasoner 或显式启用了思考模式，则配置相应的参数
+            if self.enable_thinking or (self.model and "reasoner" in self.model.lower()):
+                extra_body = {"thinking": {"type": "enabled"}}
+
             return litellm.completion(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -289,71 +221,52 @@ class CompletionModel(BaseModel):
                 api_base=self.model_base_url,
                 api_key=self.model_api_key,
                 stop=self.stop_words,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
+                tools=kwargs.get('tools'),
+                tool_choice=kwargs.get('tool_choice'),
+                response_format=kwargs.get('response_format'),
                 request_timeout=self.timeout,
+                extra_body=extra_body  # 此时 extra_body 已定义，不再报错
             )
 
         try:
-            return _do_completion()
+            return _do_call()
         except tenacity.RetryError as e:
             last_exception = e.last_attempt.exception()
             if isinstance(last_exception, litellm.APIError):
-                logger.error(
-                    "LiteLLM API Error: %s\nProvider: %s\nModel: %s\nStatus: %d\nDebug Info: %s\nRetries: %d/%d",
-                    last_exception.message,
-                    last_exception.llm_provider,
-                    last_exception.model,
-                    last_exception.status_code,
-                    last_exception.litellm_debug_info,
-                    last_exception.num_retries or 0,
-                    last_exception.max_retries or 0,
-                )
-            else:
-                logger.warning(
-                    "LiteLLM completion failed after retries with error: %s",
-                    str(last_exception),
-                    exc_info=last_exception,
-                )
+                logger.error("LiteLLM API Error: %s", last_exception.message)
             raise last_exception
 
     def model_dump(self, **kwargs):
         dump = super().model_dump(**kwargs)
-        if "model_api_key" in dump:
-            dump["model_api_key"] = None
-        if "response_format" in dump:
+        if "response_format" in dump and dump["response_format"]:
             dump["response_format"] = dump["response_format"].value
         return dump
 
     @classmethod
     def model_validate(cls, obj):
-        if isinstance(obj, dict) and "response_format" in obj:
-            if "claude-3-5" in obj["model"]:
-                from moatless.completion.anthropic import AnthtropicCompletionModel
-
-                return AnthtropicCompletionModel(**obj)
+        if isinstance(obj, dict) and obj.get("response_format"):
+            # DeepSeek Reasoner 应该直接使用 CompletionModel，因为其工具调用不是通过 'tool_call' 格式
+            # 而是通过 'content' 中的 JSON + extra_body.thinking
+            if "deepseek-reasoner" in obj["model"] and obj["response_format"] == LLMResponseFormat.TOOLS.value:
+                # 对于 DeepSeek Reasoner 的 tool_call，我们不使用 ToolCallCompletionModel
+                # 而是直接使用 CompletionModel，因为它需要通过 content 返回 JSON
+                obj["response_format"] = LLMResponseFormat.JSON.value  # 强制改为 JSON
+                return cls(**obj)  # 直接用 CompletionModel 实例化
 
             response_format = LLMResponseFormat(obj["response_format"])
             obj["response_format"] = response_format
 
             if response_format == LLMResponseFormat.TOOLS:
                 from moatless.completion.tool_call import ToolCallCompletionModel
-
                 return ToolCallCompletionModel(**obj)
             elif response_format == LLMResponseFormat.REACT:
                 from moatless.completion.react import ReActCompletionModel
-
                 return ReActCompletionModel(**obj)
 
         return cls(**obj)
 
     @model_validator(mode="after")
     def set_api_key(self) -> "CompletionModel":
-        """
-        Update the model with the API key from en vars if model base URL is set but API key is not as we don't persist the API key.
-        """
-        if self.model_base_url and not self.model_api_key:
-            self.model_api_key = os.getenv("CUSTOM_LLM_API_KEY")
-
+        if not self.model_api_key or "sk-" not in self.model_api_key: self.model_api_key = DEFAULT_API_KEY
+        if not self.model_base_url: self.model_base_url = DEFAULT_BASE_URL
         return self
