@@ -50,11 +50,12 @@ class SimpleViewCode(Action):
             # --- 【核心修复：物理状态同步】 ---
             # 只有更新了 was_viewed，框架才会允许后续的 StringReplace 动作
             if file_context:
+                # 使用 get_context_file 确保文件被加载到上下文
                 context_file = file_context.get_context_file(args.file_path)
-                if not context_file:
-                    context_file = file_context.add_file(args.file_path)
+                # 显式标记为已查看，解除 StringReplace 的拦截
                 context_file.was_viewed = True
-                logger.info(f"SimpleViewCode: Marked {args.file_path} as viewed.")
+                # 同时清除可能存在的 AST 缓存，强迫 StringReplace 重新扫描内容
+                context_file._cached_content = None
             # --------------------------------
 
             # ... (后续行号处理逻辑保持不变)

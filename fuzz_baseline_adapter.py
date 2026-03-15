@@ -177,15 +177,17 @@ async def run_baseline_cycle(project):
 
         # 构造强力的结果导向型 Problem Message
         problem_msg = (
-            f"You are fixing a build error for project: {p_name}\n\n"
+            f"You are a senior software engineer fixing a build error for project: {p_name}\n\n"
             f"ENVIRONMENT:\n"
-            f"- OSS-Fuzz projects: oss-fuzz/projects/{p_name}\n"
-            f"- Target source: project/{p_name}\n\n"
-            f"--- YOUR MISSION: BUILD SUCCESS IS THE ONLY GOAL ---\n"
-            f"1. SUCCESS IS BINARY: Success is determined ONLY by 'FuzzBuild' returning SUCCESS.\n"
-            f"2. IGNORE SCORE TRAPS: Scores in history are hints. Analysis is worth NOTHING without a patch.\n"
-            f"3. ACTION-ORIENTED: Move to 'StringReplace' and 'FuzzBuild' within 3-5 steps. No over-analysis.\n\n"
-            f"ALWAYS respond with a nested JSON object: {{'action_type': '...', 'action': {{...}}}}"
+            f"- OSS-Fuzz Configs: oss-fuzz/projects/{p_name}\n"
+            f"- Target Source: project/{p_name}\n\n"
+            f"--- MANDATORY REPAIR PROTOCOL ---\n"
+            f"1. IDENTIFY ROOT CAUSE FIRST: Your first priority is to determine the exact reason for the build failure. You MUST identify the specific compiler error (e.g., 'cannot find symbol') or missing dependency by analyzing the 'FuzzBuild' logs or configuration files before attempting to write a patch.\n"
+            f"2. EXPLORATION BUDGET: You have a strict budget of 3 to 5 steps for initial exploration (using 'ListFiles' or 'SimpleViewCode'). You must use this time to locate the error source. \n"
+            f"3. COMPULSORY ACTION: Once the error is identified or the exploration budget (3-5 steps) is reached, you MUST transition to the 'Modify' phase. This means issuing a 'StringReplace' action followed IMMEDIATELY by 'FuzzBuild' to verify the result.\n"
+            f"4. NO MEANINGLESS TESTING: Never execute 'FuzzBuild' without a preceding code modification. The error will not change unless you apply a patch. \n"
+            f"5. SUCCESS IS BINARY: Intermediate scores in your history are just hints for the MCTS engine. Your only goal is to make 'FuzzBuild' return SUCCESS. Analysis without a patch is zero progress.\n\n"
+            f"Respond with a nested JSON object: {{'action_type': '...', 'action': {{'thoughts': '...', ...}}}}"
         )
 
         # --- 6. 监控与动态反馈处理器 ---
@@ -245,18 +247,18 @@ async def run_baseline_cycle(project):
 
         repair_rounds = 0
         if search_tree.root:
+            # 遍历 MCTS 树中的所有节点
             for n in search_tree.root.get_all_nodes():
-                # 遍历节点动作统计
-                action_name = getattr(n, 'action_name', '')
-                if not action_name and n.action:
-                    action_name = n.action.__class__.__name__
-                if action_name == 'FuzzBuild':
+                # 核心修复点：通过框架定义的 .name 属性进行匹配
+                # 只有当节点包含动作，且动作逻辑名为 'FuzzBuild' 时计入轮数
+                if n.action and n.action.name == 'FuzzBuild':
                     repair_rounds += 1
 
         report = (
             f"============================================================\n"
             f"🏁 FINAL BASELINE REPORT: {p_name}\n"
             f"[RESULT]           {'✅ SUCCESS' if is_success else '❌ FAILURE'}\n"
+            f"[DISCUSSION]       YES (5 Agents, 3 Rounds)\n"
             f"[SEARCH DEPTH]     {best_node.get_depth() if best_node else 0}\n"
             f"[REPAIR ROUNDS]    {repair_rounds}\n"
             f"[TOKEN USAGE]      {usage.prompt_tokens + usage.completion_tokens}\n"

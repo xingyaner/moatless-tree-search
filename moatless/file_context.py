@@ -163,7 +163,8 @@ class ContextFile(BaseModel):
                 # 核心修复：拦截 tree-sitter 内部属性缺失导致的崩溃
                 self._cached_module = parser.parse(self.content)
             except Exception as e:
-                logger.warning(f"AST Parser (tree-sitter) crashed on {self.file_path}: {e}. Falling back to line-based mode.")
+                # 记录警告但不崩溃，让系统退回到“原始行号”模式
+                logger.warning(f"AST Parser failed for {self.file_path}: {e}. Using raw text mode.")
                 self._cached_module = None
         return self._cached_module
 

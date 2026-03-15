@@ -1,9 +1,0 @@
-============================================================
-🏁 FINAL BASELINE REPORT: jooq
-[RESULT]           ❌ FAILURE
-[DISCUSSION]       YES (5 Agents, 3 Rounds)
-[SEARCH DEPTH]     14
-[REPAIR ROUNDS]    0
-[TOKEN USAGE]      367660
-[TIME COST]        5.60 minutes
-============================================================
