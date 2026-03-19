@@ -13,5 +13,5 @@
   error_category: RC13
   fixed_state: 'no'
   state: 'yes'
-  fix_result: Failure
-  fix_date: '2026-03-15'
+  fix_result: Success
+  fix_date: '2026-03-19'

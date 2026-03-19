@@ -151,12 +151,12 @@ class CompletionModel(BaseModel):
                     tool_args = msg_obj.tool_calls[0].function.arguments
 
                 # 【核心拦截点】：打印绝对原始的 LLM 响应，不加任何处理
-                print("\n" + "█" * 40 + " [ABSOLUTE RAW LLM START] " + "█" * 40)
+                print("\n" + "-" * 40 + " [ABSOLUTE RAW LLM START] " + "-" * 40)
                 # 使用 repr() 打印，可以看清换行符、不可见字符和特殊标记
                 print(f"RAW_CONTENT: {repr(content)}")
                 print(f"RAW_REASONING: {repr(reasoning)}")
                 print(f"RAW_TOOL_CALLS: {repr(tool_args)}")
-                print("█" * 40 + " [ABSOLUTE RAW LLM END] " + "█" * 40 + "\n")
+                print("-" * 40 + " [ABSOLUTE RAW LLM END] " + "-" * 40 + "\n")
 
 
                 # --- 合并思维链和正文，确保 JSON 不被遗漏 ---
@@ -169,12 +169,12 @@ class CompletionModel(BaseModel):
                     logger.warning("DeepSeek returned whitespace. Injecting error to trigger retry.")
                     combined_input = "ERROR: Your response was empty. Please provide a valid JSON action."
                 # --- 【新增：证据拦截打印】 ---
-                print("\n" + "!"*30 + " [RAW LLM DATA START] " + "!"*30)
+                print("\n" + "*"*30 + " [RAW LLM DATA START] " + "*"*30)
                 print(f"MODEL: {self.model}")
                 print(f"REASONING LENGTH: {len(reasoning)}")
                 print(f"CONTENT LENGTH: {len(content)}")
                 print(f"RAW COMBINED INPUT:\n{combined_input}")
-                print("!"*30 + " [RAW LLM DATA END] " + "!"*30 + "\n")
+                print("*"*30 + " [RAW LLM DATA END] " + "*"*30 + "\n")
 
                 assistant_history_entry = {"role": "assistant", "content": content}
                 if reasoning:

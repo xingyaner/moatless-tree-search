@@ -11,12 +11,13 @@ logger = logging.getLogger(__name__)
 
 class SimpleViewCodeArgs(ActionArguments):
     """鲁棒的文件读取工具参数。"""
+    class Config:
+        title = "SimpleViewCode"
+
     thoughts: str = Field(..., description="查看文件的理由。")
     file_path: str = Field(..., description="相对路径。")
     view_mode: Literal["full", "head", "tail"] = Field(default="full")
 
-    class Config:
-        title = "SimpleViewCode"
 
 
 class SimpleViewCode(Action):

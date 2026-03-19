@@ -239,19 +239,29 @@ async def run_baseline_cycle(project):
         print(f"--- [MCTS SEARCH START] Monitoring for loops... ---")
         best_node = search_tree.run_search()
 
-        # --- 8. 统计与持久化报告 ---
+        is_success = False
+        if best_node:
+            # 1. 满足原生的 Finish 动作
+            if best_node.is_finished():
+                is_success = True
+            # 2. 或者满足我们注入的 1+6 终止信号
+            elif best_node.observation and getattr(best_node.observation, "terminal", False):
+                if "SUCCESS" in best_node.observation.message.upper():
+                    is_success = True
+        # ------------------------------------
+
         end_time = time.time()
-        is_success = best_node.is_finished() if (best_node and hasattr(best_node, 'is_finished')) else False
         duration_min = (end_time - start_time) / 60
         usage = search_tree.total_usage()
 
         repair_rounds = 0
         if search_tree.root:
-            # 遍历 MCTS 树中的所有节点
             for n in search_tree.root.get_all_nodes():
-                # 核心修复点：通过框架定义的 .name 属性进行匹配
-                # 只有当节点包含动作，且动作逻辑名为 'FuzzBuild' 时计入轮数
-                if n.action and n.action.name == 'FuzzBuild':
+                # 兼容性统计：优先尝试 .name 属性
+                action_name = ""
+                if n.action:
+                    action_name = getattr(n.action, "name", n.action.__class__.__name__)
+                if action_name == 'FuzzBuild':
                     repair_rounds += 1
 
         report = (
@@ -266,6 +276,7 @@ async def run_baseline_cycle(project):
             f"============================================================\n"
         )
         print(report)
+
 
         # 写入物理报告
         with open(os.path.join(LOG_DIR, f"{p_name}_final_report.txt"), "w", encoding="utf-8") as f:
@@ -290,6 +301,8 @@ async def run_baseline_cycle(project):
         # 彻底恢复 stdout 避免后续打印丢失
         sys.stdout = original_stdout
         print(f"--- [Project Finish] All logs synced to: {full_log_path} ---")
+
+
 async def main():
     print("--- [Isolated Baseline Runner Init] ---")
     if not os.path.exists(YAML_PATH):
