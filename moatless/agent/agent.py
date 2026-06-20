@@ -32,6 +32,38 @@ class ActionAgent(BaseModel):
     )
     thoughts_in_action: bool = Field(True, description="")
     actions: List[Action] = Field(default_factory=list)
+    mandatory_patch_verification: bool = Field(
+        default=False,
+        description="Whether to force at least one patch and one verification action before completion.",
+    )
+    exploration_budget: int = Field(
+        default=0,
+        description="How many executed steps are allowed before gating exploration actions.",
+    )
+    patch_action_names: List[str] = Field(
+        default_factory=lambda: ["StringReplace"],
+        description="Action names that count as applying a patch.",
+    )
+    verification_action_names: List[str] = Field(
+        default_factory=lambda: ["FuzzBuild"],
+        description="Action names that count as verification.",
+    )
+    force_patch_after_steps: int = Field(
+        default=0,
+        description="Force at least one patch after this many executed steps in the current trajectory.",
+    )
+    force_verify_after_steps: int = Field(
+        default=0,
+        description="Force verification after this many executed steps once a patch exists.",
+    )
+    fail_if_no_patch_by_steps: int = Field(
+        default=0,
+        description="Fail the node if no patch has been applied by this many executed steps.",
+    )
+    fail_if_no_verification_by_steps: int = Field(
+        default=0,
+        description="Fail the node if no verification has been executed by this many steps after patching.",
+    )
     message_generator: MessageHistoryGenerator = Field(
         default_factory=lambda: MessageHistoryGenerator(),
         description="Generator for message history",
@@ -100,9 +132,51 @@ class ActionAgent(BaseModel):
             logger.info(f"Node{node.node_id}: Resetting node")
             node.reset()
 
-        node.possible_actions = [action.name for action in self.actions]
+        gate_failure = self._get_gate_failure(node)
+        if gate_failure:
+            print(
+                f"[DIAG ActionAgent] Node {node.node_id} gate failure before action generation: {gate_failure}",
+                flush=True,
+            )
+            node.terminal = True
+            node.error = gate_failure
+            node.observation = Observation(message=gate_failure, terminal=True)
+            logger.warning(f"Node{node.node_id}: {gate_failure}")
+            return
+
+        available_actions = self._get_available_actions(node)
+        node.possible_actions = [action.name for action in available_actions]
+        trajectory = node.get_trajectory()
+        executed_action_names = [
+            step.action.name
+            for trajectory_node in trajectory
+            for step in trajectory_node.action_steps
+            if step.action
+        ]
+        has_patch = any(name in self.patch_action_names for name in executed_action_names)
+        has_verification = any(
+            name in self.verification_action_names for name in executed_action_names
+        )
+        print(
+            "[DIAG ActionAgent] "
+            f"Node {node.node_id} available actions={node.possible_actions} | "
+            f"executed_steps={len(executed_action_names)} | "
+            f"has_patch={has_patch} | has_verification={has_verification} | "
+            f"mandatory_patch_verification={self.mandatory_patch_verification}",
+            flush=True,
+        )
+        if "StringReplace" not in node.possible_actions:
+            print(
+                f"[DIAG ActionAgent] Node {node.node_id} StringReplace is NOT available in this step.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[DIAG ActionAgent] Node {node.node_id} StringReplace is available for selection.",
+                flush=True,
+            )
         system_prompt = self.generate_system_prompt()
-        action_args = [action.args_schema for action in self.actions]
+        action_args = [action.args_schema for action in available_actions]
 
         messages = self.message_generator.generate(node)
         logger.info(f"Node{node.node_id}: Build action with {len(messages)} messages")
@@ -116,6 +190,16 @@ class ActionAgent(BaseModel):
                     ActionStep(action=action)
                     for action in completion_response.structured_outputs
                 ]
+                selected_actions = [action.name for action in completion_response.structured_outputs]
+                print(
+                    f"[DIAG ActionAgent] Node {node.node_id} model selected actions={selected_actions}",
+                    flush=True,
+                )
+                if "StringReplace" in node.possible_actions and "StringReplace" not in selected_actions:
+                    print(
+                        f"[DIAG ActionAgent] Node {node.node_id} model skipped StringReplace despite it being available.",
+                        flush=True,
+                    )
 
             node.assistant_message = completion_response.text_response
 
@@ -139,11 +223,19 @@ class ActionAgent(BaseModel):
                 raise e
 
         if node.action is None:
+            print(
+                f"[DIAG ActionAgent] Node {node.node_id} produced no executable action after completion parsing.",
+                flush=True,
+            )
             return
 
         duplicate_node = node.find_duplicate()
         if duplicate_node:
             node.is_duplicate = True
+            print(
+                f"[DIAG ActionAgent] Node {node.node_id} is duplicate of Node {duplicate_node.node_id}; execution skipped.",
+                flush=True,
+            )
             logger.info(
                 f"Node{node.node_id} is a duplicate to Node{duplicate_node.node_id}. Skipping execution."
             )
@@ -152,6 +244,114 @@ class ActionAgent(BaseModel):
         logger.info(f"Node{node.node_id}: Execute {len(node.action_steps)} actions")
         for action_step in node.action_steps:
             self._execute(node, action_step)
+
+    def _get_available_actions(self, node: Node) -> List[Action]:
+        if not self.mandatory_patch_verification:
+            print(
+                f"[DIAG ActionAgent] Node {node.node_id} patch gating disabled; returning all actions.",
+                flush=True,
+            )
+            return self.actions
+
+        trajectory = node.get_trajectory()
+        executed_action_names = [
+            step.action.name
+            for trajectory_node in trajectory
+            for step in trajectory_node.action_steps
+            if step.action
+        ]
+
+        executed_steps = len(executed_action_names)
+        has_patch = any(name in self.patch_action_names for name in executed_action_names)
+        has_verification = any(
+            name in self.verification_action_names for name in executed_action_names
+        )
+
+        if self.exploration_budget and executed_steps < self.exploration_budget:
+            print(
+                "[DIAG ActionAgent] "
+                f"Node {node.node_id} within exploration budget: executed_steps={executed_steps}, "
+                f"exploration_budget={self.exploration_budget}. Returning all actions.",
+                flush=True,
+            )
+            return self.actions
+
+        if self.force_patch_after_steps and executed_steps >= self.force_patch_after_steps and not has_patch:
+            gated_names = set(self.patch_action_names)
+            gated_actions = [action for action in self.actions if action.name in gated_names]
+            if gated_actions:
+                print(
+                    "[DIAG ActionAgent] "
+                    f"Node {node.node_id} forcing patch-only actions after {executed_steps} steps. "
+                    f"Allowed now={[action.name for action in gated_actions]}",
+                    flush=True,
+                )
+                logger.info(
+                    f"Node{node.node_id}: Forcing patch-only actions after {executed_steps} steps"
+                )
+                return gated_actions
+
+        if (
+            self.force_verify_after_steps
+            and executed_steps >= self.force_verify_after_steps
+            and has_patch
+            and not has_verification
+        ):
+            gated_names = set(self.patch_action_names + self.verification_action_names)
+            gated_actions = [action for action in self.actions if action.name in gated_names]
+            if gated_actions:
+                print(
+                    "[DIAG ActionAgent] "
+                    f"Node {node.node_id} forcing patch/verification actions after patch application. "
+                    f"Allowed now={[action.name for action in gated_actions]}",
+                    flush=True,
+                )
+                logger.info(
+                    f"Node{node.node_id}: Forcing verification-capable actions after patch application"
+                )
+                return gated_actions
+
+        print(
+            "[DIAG ActionAgent] "
+            f"Node {node.node_id} no patch/verification gate applied. Returning all actions.",
+            flush=True,
+        )
+        return self.actions
+
+    def _get_gate_failure(self, node: Node) -> str | None:
+        if not self.mandatory_patch_verification:
+            return None
+
+        trajectory = node.get_trajectory()
+        executed_action_names = [
+            step.action.name
+            for trajectory_node in trajectory
+            for step in trajectory_node.action_steps
+            if step.action
+        ]
+
+        executed_steps = len(executed_action_names)
+        has_patch = any(name in self.patch_action_names for name in executed_action_names)
+        has_verification = any(
+            name in self.verification_action_names for name in executed_action_names
+        )
+
+        if self.fail_if_no_patch_by_steps and executed_steps >= self.fail_if_no_patch_by_steps and not has_patch:
+            return (
+                f"Mandatory patch phase failed: no patch action was executed by step {executed_steps}."
+            )
+
+        if (
+            self.fail_if_no_verification_by_steps
+            and executed_steps >= self.fail_if_no_verification_by_steps
+            and has_patch
+            and not has_verification
+        ):
+            return (
+                f"Mandatory verification phase failed: no verification action was executed by step {executed_steps}."
+            )
+
+        return None
 
     def _execute(self, node: Node, action_step: ActionStep):
         action = self._action_map.get(type(action_step.action))
@@ -163,6 +363,10 @@ class ActionAgent(BaseModel):
             raise RuntimeError(f"Action {type(node.action)} not found in action map.")
 
         try:
+            print(
+                f"[DIAG ActionAgent] Node {node.node_id} executing action={action_step.action.name}",
+                flush=True,
+            )
             action_step.observation = action.execute(
                 action_step.action, node.file_context, node.workspace
             )
@@ -182,6 +386,17 @@ class ActionAgent(BaseModel):
                 f"Terminal: {action_step.observation.terminal if node.observation else False}. "
                 f"Output: {action_step.observation.message if node.observation else None}"
             )
+            if action_step.observation:
+                fail_reason = None
+                if action_step.observation.properties:
+                    fail_reason = action_step.observation.properties.get("fail_reason")
+                print(
+                    "[DIAG ActionAgent] "
+                    f"Node {node.node_id} action={action_step.action.name} summary={action_step.observation.summary} | "
+                    f"expect_correction={action_step.observation.expect_correction} | "
+                    f"fail_reason={fail_reason}",
+                    flush=True,
+                )
 
         except CompletionRejectError as e:
             logger.warning(f"Node{node.node_id}: Action rejected: {e.message}")

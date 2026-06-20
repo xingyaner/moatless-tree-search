@@ -22,7 +22,7 @@ from moatless.exceptions import CompletionRejectError, CompletionRuntimeError
 # --- 硬编码 API 配置区 (Hardcoded API Config) ---
 # =================================================================
 # 已经按照您的指令填入 DeepSeek API 信息
-DEFAULT_API_KEY = "sk-"
+DEFAULT_API_KEY = ""
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 # =================================================================
 
@@ -99,13 +99,16 @@ class CompletionModel(BaseModel):
         if not response_model:
             raise CompletionRuntimeError(f"Response model is required for completion")
 
+        if isinstance(response_model, list) and len(response_model) == 1:
+            response_model = response_model[0]
+
         if isinstance(response_model, list) and len(response_model) > 1:
             avalabile_actions = [a for a in response_model if hasattr(a, "name")]
             if not avalabile_actions:
                 raise CompletionRuntimeError(f"No actions found in {response_model}")
 
             class TakeAction(StructuredOutput):
-                action: Union[tuple(response_model)] = Field(...)
+                action: Any = Field(...)
                 action_type: str = Field(..., description="The type of action being taken")
 
                 @model_validator(mode="before")
@@ -113,8 +116,16 @@ class CompletionModel(BaseModel):
                     if not isinstance(data, dict): return data
                     action_type = data.get("action_type")
                     if not action_type: return data
+                    alias_map = {
+                        "ViewFile": "SimpleViewCode",
+                        "ViewBuildScript": "SimpleViewCode",
+                    }
+                    if action_type in alias_map:
+                        data["action_type"] = alias_map[action_type]
+                        action_type = data["action_type"]
                     action_class = next((a for a in avalabile_actions if a.name == action_type), None)
-                    if not action_class: raise ValidationError(f"Unknown action {action_type}")
+                    if not action_class:
+                        raise ValueError(f"Unknown action {action_type}")
                     data["action"] = action_class.model_validate(data.get("action"))
                     return data
 
@@ -123,8 +134,23 @@ class CompletionModel(BaseModel):
         # --- 【关键修正 1】防止 System 消息重复插入 ---
         current_messages = messages.copy()
         if not current_messages or current_messages[0].get("role") != "system":
+            response_schema = json.dumps(response_model.model_json_schema(), indent=2, ensure_ascii=False)
             full_system = system_prompt + dedent(
-                f"""\n# Response format\nYou must respond with only a JSON object matching the schema:\n{json.dumps(response_model.model_json_schema(), indent=2, ensure_ascii=False)}\n""")
+                """
+                # Response format
+                You must respond with only a JSON object matching the schema:
+                """
+            ) + response_schema + dedent(
+                """
+
+                Critical formatting rules:
+                - The top-level response must be a JSON object, not prose.
+                - If there is an 'action' field, it MUST be a JSON object of action arguments, never a string label like 'view', 'explore', or 'fix_build_error'.
+                - Do NOT invent generic action names or summaries. Populate the exact fields required by the schema.
+                - Invalid example: {"action": "view_build_script", "action_type": "view"}
+                - Valid example: {"action_type": "SimpleViewCode", "action": {"thoughts": "Inspect the build script.", "file_path": "oss-fuzz/projects/jooq/build.sh"}}
+                """
+            )
             current_messages.insert(0, {"role": "system", "content": full_system})
 
         retries = tenacity.Retrying(
@@ -134,6 +160,80 @@ class CompletionModel(BaseModel):
 
         def _do_completion():
             completion_response = None
+
+            def _attempt_json_repair(raw_reasoning: str, raw_content: str, raw_tool_args: str):
+                """Ask the model to restate its own intent as JSON only."""
+                repair_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Rewrite the assistant's previous response as a valid JSON object only. "
+                            "Do not add explanations, markdown, or prose. Preserve the intended action. "
+                            "If there is an 'action' field, it MUST be an object of action arguments, never a string such as 'explore', 'view_build_script', or 'fix_build_error'."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Return one JSON object that matches this schema exactly:\n"
+                            f"{json.dumps(response_model.model_json_schema(), indent=2, ensure_ascii=False)}\n\n"
+                            "Important rules:\n"
+                            "- Do not return generic string actions.\n"
+                            "- If the schema expects action arguments, fill the argument object itself.\n"
+                            "- Invalid example: {\"action\": \"check_directory\", \"action_type\": \"list\"}\n"
+                            "- Valid example: {\"action_type\": \"ListFiles\", \"action\": {\"thoughts\": \"List the relevant directory.\", \"directory\": \"project/jooq\"}}\n\n"
+                            "Previous assistant reasoning:\n"
+                            f"{raw_reasoning or '<empty>'}\n\n"
+                            "Previous assistant content:\n"
+                            f"{raw_content or '<empty>'}\n\n"
+                            "Previous tool arguments:\n"
+                            f"{raw_tool_args or '<empty>'}"
+                        ),
+                    },
+                ]
+
+                repair_response = self._litellm_base_completion(
+                    messages=repair_messages,
+                    response_format={"type": "json_object"},
+                )
+                if not repair_response or not repair_response.choices:
+                    raise CompletionRuntimeError("No repair completion response or choices returned")
+
+                repair_msg = repair_response.choices[0].message
+                repair_content = repair_msg.content if repair_msg.content is not None else ""
+                repair_reasoning = getattr(repair_msg, "reasoning_content", None) or ""
+                repair_tool_args = ""
+                if hasattr(repair_msg, "tool_calls") and repair_msg.tool_calls:
+                    repair_tool_args = repair_msg.tool_calls[0].function.arguments
+
+                print("\n" + "#" * 40 + " [JSON REPAIR START] " + "#" * 40)
+                print(f"REPAIR_CONTENT: {repr(repair_content)}")
+                print(f"REPAIR_REASONING: {repr(repair_reasoning)}")
+                print(f"REPAIR_TOOL_CALLS: {repr(repair_tool_args)}")
+                print("#" * 40 + " [JSON REPAIR END] " + "#" * 40 + "\n")
+
+                repair_combined_input = f"{repair_reasoning}\n{repair_content}\n{repair_tool_args}".strip()
+                repair_combined_input = repair_combined_input + "\n[RESPONSE_END]"
+
+                # Repair pass should prefer the returned JSON body itself.
+                # The model often includes explanatory reasoning that would pollute
+                # the combined parsing path even when content is already valid JSON.
+                has_repair_content = bool(repair_content and repair_content.strip())
+                primary_repair_payload = repair_content.strip() if has_repair_content else repair_combined_input
+                if has_repair_content:
+                    primary_repair_payload = primary_repair_payload + "\n[RESPONSE_END]"
+
+                repaired = response_model.model_validate_json(primary_repair_payload if primary_repair_payload else "{}")
+                repair_completion = Completion.from_llm_completion(
+                    input_messages=repair_messages,
+                    completion_response=repair_response,
+                    model=self.model,
+                )
+
+                if hasattr(repaired, "action"):
+                    return CompletionResponse.create(output=repaired.action, completion=repair_completion)
+                return CompletionResponse.create(output=repaired, completion=repair_completion)
+
             try:
                 # 开启 DeepSeek 官方 JSON 模式
                 completion_response = self._litellm_base_completion(messages=current_messages,
@@ -151,12 +251,12 @@ class CompletionModel(BaseModel):
                     tool_args = msg_obj.tool_calls[0].function.arguments
 
                 # 【核心拦截点】：打印绝对原始的 LLM 响应，不加任何处理
-                print("\n" + "-" * 40 + " [ABSOLUTE RAW LLM START] " + "-" * 40)
+                print("\n" + "█" * 40 + " [ABSOLUTE RAW LLM START] " + "█" * 40)
                 # 使用 repr() 打印，可以看清换行符、不可见字符和特殊标记
                 print(f"RAW_CONTENT: {repr(content)}")
                 print(f"RAW_REASONING: {repr(reasoning)}")
                 print(f"RAW_TOOL_CALLS: {repr(tool_args)}")
-                print("-" * 40 + " [ABSOLUTE RAW LLM END] " + "-" * 40 + "\n")
+                print("█" * 40 + " [ABSOLUTE RAW LLM END] " + "█" * 40 + "\n")
 
 
                 # --- 合并思维链和正文，确保 JSON 不被遗漏 ---
@@ -169,12 +269,12 @@ class CompletionModel(BaseModel):
                     logger.warning("DeepSeek returned whitespace. Injecting error to trigger retry.")
                     combined_input = "ERROR: Your response was empty. Please provide a valid JSON action."
                 # --- 【新增：证据拦截打印】 ---
-                print("\n" + "*"*30 + " [RAW LLM DATA START] " + "*"*30)
+                print("\n" + "!"*30 + " [RAW LLM DATA START] " + "!"*30)
                 print(f"MODEL: {self.model}")
                 print(f"REASONING LENGTH: {len(reasoning)}")
                 print(f"CONTENT LENGTH: {len(content)}")
                 print(f"RAW COMBINED INPUT:\n{combined_input}")
-                print("*"*30 + " [RAW LLM DATA END] " + "*"*30 + "\n")
+                print("!"*30 + " [RAW LLM DATA END] " + "!"*30 + "\n")
 
                 assistant_history_entry = {"role": "assistant", "content": content}
                 if reasoning:
@@ -192,6 +292,13 @@ class CompletionModel(BaseModel):
                 return CompletionResponse.create(output=response, completion=completion_obj)
 
             except (ValidationError, json.JSONDecodeError, ValueError) as e:
+                if completion_response:
+                    try:
+                        logger.warning("Primary JSON parsing failed; attempting JSON repair pass.")
+                        return _attempt_json_repair(reasoning, content, tool_args)
+                    except Exception as repair_error:
+                        logger.warning(f"JSON repair pass failed: {repair_error}")
+
                 # 这就是闭环的关键：将解析器的报错发回给 LLM
                 feedback_msg = f"FORMAT ERROR: {str(e)}"
                 logger.warning(f"Validation failed: {feedback_msg}. Retrying with feedback.")

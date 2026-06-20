@@ -141,7 +141,7 @@ Your task is to carefully evaluate each change and decide which one is the most 
         finished_nodes = [
             n
             for n in nodes
-            if n.action.name == "Finish"
+            if n.action and n.action.name == "Finish"
             and n.file_context
             and n.file_context.generate_git_patch()
         ]
@@ -193,6 +193,8 @@ Your task is to carefully evaluate each change and decide which one is the most 
                     counter = 0
 
                     for previous_node in node_history:
+                        if not previous_node.action:
+                            continue
                         counter += 1
                         formatted_state = (
                             f"\n# {counter}. Action: {previous_node.action.name}\n\n"

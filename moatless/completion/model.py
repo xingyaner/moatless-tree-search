@@ -334,6 +334,7 @@ class StructuredOutput(BaseModel):
         logger = logging.getLogger(__name__)
         # 统一转码
         message = json_data.decode("utf-8") if isinstance(json_data, (bytes, bytearray)) else json_data
+        expects_nested_action = "action_type" in cls.model_json_schema().get("properties", {})
 
         # 1. 强力清洗干扰标记
         message = re.sub(r'<[^>]*｜[^>]*>', '', message)
@@ -375,17 +376,29 @@ class StructuredOutput(BaseModel):
                     inferred = "ListFiles"
                 elif "thoughts" in target:
                     inferred = "FuzzBuild"
-                if inferred: parsed_data = {"action_type": inferred, "action": target}
+                if inferred and expects_nested_action:
+                    parsed_data = {"action_type": inferred, "action": target}
+                elif inferred:
+                    parsed_data = target
+
+            if "action" in parsed_data and not isinstance(parsed_data.get("action"), dict):
+                logger.warning(
+                    "Invalid action payload type %s; expected object-style action arguments.",
+                    type(parsed_data.get("action")).__name__,
+                )
+                parsed_data = None
 
             # 针对 SimpleViewCode 习惯的单路径自愈
-            if parsed_data.get("action_type") == "ViewCode" or parsed_data.get("action_type") == "SimpleViewCode":
+            if isinstance(parsed_data, dict) and (
+                parsed_data.get("action_type") == "ViewCode" or parsed_data.get("action_type") == "SimpleViewCode"
+            ):
                 args = parsed_data.get("action", {})
                 if "file_path" in args and "files" not in args and parsed_data.get("action_type") == "ViewCode":
                     args["files"] = [{"file_path": args.pop("file_path"), "start_line": 1, "end_line": 2000}]
                     parsed_data["action"] = args
 
             # 补全 thoughts
-            if "action" in parsed_data and "thoughts" not in parsed_data["action"]:
+            if isinstance(parsed_data, dict) and "action" in parsed_data and isinstance(parsed_data["action"], dict) and "thoughts" not in parsed_data["action"]:
                 parsed_data["action"]["thoughts"] = "Analyzing identified path and proceeding."
 
         # --- 【修改 B 插入位置】：拦截由于“踌躇”导致的空解析 ---

@@ -28,7 +28,9 @@ from moatless.discriminator import AgentDiscriminator
 LOG_DIR = os.path.join(BASE_DIR, "log")
 os.makedirs(LOG_DIR, exist_ok=True)
 YAML_PATH = os.path.join(BASE_DIR, "projects.yaml")
-
+MAX_SEARCH_ITERATIONS = 20
+LATE_STAGE_ADVISORY_REMAINING = 5
+Max_expansions= 2
 
 class TeeLogger:
     """将控制台输出同步复制到文件。"""
@@ -127,7 +129,7 @@ async def run_baseline_cycle(project):
 
         # --- 4. 初始化模型与工具 ---
         action_llm = CompletionModel(
-            model="deepseek/deepseek-chat",
+            model="deepseek/deepseek-v4-flash",
             temperature=0.2,
             max_tokens=4000,
             response_format=LLMResponseFormat.JSON
@@ -155,11 +157,27 @@ async def run_baseline_cycle(project):
         # --- 5. 构造 Agent 与提示词 ---
         strict_system_prompt = (
             "You are a senior software engineer specialized in fixing build errors.\n"
-            "GUIDELINES:\n"
-            "1. Use 'ListFiles' to explore directory contents. Do NOT use 'ViewCode' on directories.\n"
-            "2. Use 'SimpleViewCode' to read specific source files or build scripts.\n"
-            "3. After applying changes, you MUST use 'FuzzBuild' to verify your fix.\n"
-            "4. ALWAYS respond with a nested JSON object containing 'action_type' and 'action'."
+            "AVAILABLE TOOLS:\n"
+            "- 'ListFiles': browse a directory.\n"
+            "- 'SimpleViewCode': read one specific file.\n"
+            "- 'StringReplace': modify code by replacing exact existing text.\n"
+            "- 'FuzzBuild': run the OSS-Fuzz build. This tool has both a diagnostic role and a verification role.\n"
+            "- 'Finish': conclude the attempt with a final success or failure summary.\n"
+            "- 'Reject': use only if the task cannot be completed.\n\n"
+            "FORBIDDEN TOOLS OR ACTION NAMES:\n"
+            "- Do NOT output or invent tools/actions such as 'ReadFile', 'ViewFile', 'ViewBuildScript', 'RunCommand', 'CheckFiles', 'ExploreDirectory', 'ViewCode', or any other unlisted action.\n"
+            "- Only use the exact action names listed in AVAILABLE TOOLS.\n\n"
+            "FUZZBUILD USAGE MODES:\n"
+            "- Diagnostic mode: 'FuzzBuild' may be used before any patch exists. In this mode, its purpose is to obtain the real build failure log and establish the repair direction.\n"
+            "- Verification mode: 'FuzzBuild' may also be used after a patch has been produced and successfully applied. In this mode, its purpose is to verify whether the fix actually works.\n"
+            "- If no patch has been produced and applied yet, then 'FuzzBuild' is not verification; it is only another diagnostic build that re-checks the current error state.\n\n"
+            "REQUIRED WORKFLOW:\n"
+            "1. Browsing is only allowed with 'ListFiles' or 'SimpleViewCode'.\n"
+            "2. Code modification is only allowed with 'StringReplace'.\n"
+            "3. After any successful code change, the very next verification step should be 'FuzzBuild'. Do not keep exploring instead of verifying unless you have a specific reason.\n"
+            "4. Before giving a final success or failure conclusion, you must use 'Finish'.\n"
+            "5. Do NOT use 'Finish' before you have either verified with 'FuzzBuild' after a patch, or concluded that no valid fix can be produced.\n"
+            "6. Respond with a nested JSON object containing 'action_type' and 'action'."
         )
 
         agent = CodingAgent(
@@ -181,12 +199,19 @@ async def run_baseline_cycle(project):
             f"ENVIRONMENT:\n"
             f"- OSS-Fuzz Configs: oss-fuzz/projects/{p_name}\n"
             f"- Target Source: project/{p_name}\n\n"
-            f"--- MANDATORY REPAIR PROTOCOL ---\n"
-            f"1. IDENTIFY ROOT CAUSE FIRST: Your first priority is to determine the exact reason for the build failure. You MUST identify the specific compiler error (e.g., 'cannot find symbol') or missing dependency by analyzing the 'FuzzBuild' logs or configuration files before attempting to write a patch.\n"
-            f"2. EXPLORATION BUDGET: You have a strict budget of 3 to 5 steps for initial exploration (using 'ListFiles' or 'SimpleViewCode'). You must use this time to locate the error source. \n"
-            f"3. COMPULSORY ACTION: Once the error is identified or the exploration budget (3-5 steps) is reached, you MUST transition to the 'Modify' phase. This means issuing a 'StringReplace' action followed IMMEDIATELY by 'FuzzBuild' to verify the result.\n"
-            f"4. NO MEANINGLESS TESTING: Never execute 'FuzzBuild' without a preceding code modification. The error will not change unless you apply a patch. \n"
-            f"5. SUCCESS IS BINARY: Intermediate scores in your history are just hints for the MCTS engine. Your only goal is to make 'FuzzBuild' return SUCCESS. Analysis without a patch is zero progress.\n\n"
+            f"You may only call these actions: 'ListFiles', 'SimpleViewCode', 'StringReplace', 'FuzzBuild', 'Finish', 'Reject'.\n"
+            f"Do not call any other action name, even if it sounds similar. In particular, never output 'ReadFile', 'ViewFile', 'ViewBuildScript', 'RunCommand', 'CheckFiles', 'ExploreDirectory', or 'ViewCode'.\n\n"
+            f"Interpret 'FuzzBuild' carefully:\n"
+            f"- In diagnostic mode, it can be used before any patch exists, and its purpose is to collect the real build failure log and determine the repair direction.\n"
+            f"- In verification mode, it is used only after a patch has been produced and successfully applied, and its purpose is to verify whether the fix works.\n"
+            f"- If no patch exists yet, then running 'FuzzBuild' is not fix verification. It is only another diagnostic build run to inspect the current error.\n\n"
+            f"Mandatory execution rules:\n"
+            f"- Browsing is only allowed with 'ListFiles' or 'SimpleViewCode'.\n"
+            f"- Modification is only allowed with 'StringReplace'.\n"
+            f"- Once you successfully modify code, you should run 'FuzzBuild' before concluding the attempt, because at that point it serves as verification.\n"
+            f"- Before any final success or failure conclusion, you must use 'Finish'.\n"
+            f"- Do not stay in endless exploration. If you have enough evidence, apply a concrete patch.\n\n"
+            f"Intermediate scores in your history are hints from the search process; prioritize actions that move the build toward a verified result.\n\n"
             f"Respond with a nested JSON object: {{'action_type': '...', 'action': {{'thoughts': '...', ...}}}}"
         )
 
@@ -217,7 +242,18 @@ async def run_baseline_cycle(project):
         def tree_event_handler(event_type, node=None, data=None):
             if event_type == "tree_iteration":
                 it_data = data or {}
-                print(f"\n--- [Iteration {it_data.get('iteration')}] Best Reward: {it_data.get('best_reward')} ---")
+                iteration = it_data.get('iteration') or 0
+                print(f"\n--- [Iteration {iteration}] Best Reward: {it_data.get('best_reward')} ---")
+
+                remaining_attempts = max(0, MAX_SEARCH_ITERATIONS - iteration)
+                if remaining_attempts <= LATE_STAGE_ADVISORY_REMAINING and search_tree.root and not getattr(search_tree.root, "_late_stage_advisory_injected", False):
+                    advisory = (
+                        f"\n\n--- [SYSTEM ADVISORY] ---\n"
+                        f"You have only {remaining_attempts} attempts left. Continuing to explore may leave no chance to apply a patch and verify it. "
+                        f"If you already have enough evidence, prioritize producing a concrete code patch now and then run 'FuzzBuild' to verify it."
+                    )
+                    search_tree.root.user_message = (search_tree.root.user_message or "") + advisory
+                    search_tree.root._late_stage_advisory_injected = True
             elif event_type == "search_step" and node:
                 # 修正：使用 node.node_id
                 print(f"--- [Search] Node: {node.node_id} | Depth: {node.get_depth()} ---")
@@ -230,8 +266,8 @@ async def run_baseline_cycle(project):
             repository=repository,
             value_function=value_fn,
             discriminator=discriminator,
-            max_iterations=15,
-            max_expansions=1,
+            max_iterations=MAX_SEARCH_ITERATIONS,
+            max_expansions=Max_expansions,
             persist_path=os.path.join(LOG_DIR, f"{p_name}_trajectory.json")
         )
         search_tree.event_handlers.append(tree_event_handler)
@@ -239,29 +275,19 @@ async def run_baseline_cycle(project):
         print(f"--- [MCTS SEARCH START] Monitoring for loops... ---")
         best_node = search_tree.run_search()
 
-        is_success = False
-        if best_node:
-            # 1. 满足原生的 Finish 动作
-            if best_node.is_finished():
-                is_success = True
-            # 2. 或者满足我们注入的 1+6 终止信号
-            elif best_node.observation and getattr(best_node.observation, "terminal", False):
-                if "SUCCESS" in best_node.observation.message.upper():
-                    is_success = True
-        # ------------------------------------
-
+        # --- 8. 统计与持久化报告 ---
         end_time = time.time()
+        is_success = best_node.is_finished() if (best_node and hasattr(best_node, 'is_finished')) else False
         duration_min = (end_time - start_time) / 60
         usage = search_tree.total_usage()
 
         repair_rounds = 0
         if search_tree.root:
+            # 遍历 MCTS 树中的所有节点
             for n in search_tree.root.get_all_nodes():
-                # 兼容性统计：优先尝试 .name 属性
-                action_name = ""
-                if n.action:
-                    action_name = getattr(n.action, "name", n.action.__class__.__name__)
-                if action_name == 'FuzzBuild':
+                # 核心修复点：通过框架定义的 .name 属性进行匹配
+                # 只有当节点包含动作，且动作逻辑名为 'FuzzBuild' 时计入轮数
+                if n.action and n.action.name == 'FuzzBuild':
                     repair_rounds += 1
 
         report = (
@@ -276,7 +302,6 @@ async def run_baseline_cycle(project):
             f"============================================================\n"
         )
         print(report)
-
 
         # 写入物理报告
         with open(os.path.join(LOG_DIR, f"{p_name}_final_report.txt"), "w", encoding="utf-8") as f:
@@ -301,8 +326,6 @@ async def run_baseline_cycle(project):
         # 彻底恢复 stdout 避免后续打印丢失
         sys.stdout = original_stdout
         print(f"--- [Project Finish] All logs synced to: {full_log_path} ---")
-
-
 async def main():
     print("--- [Isolated Baseline Runner Init] ---")
     if not os.path.exists(YAML_PATH):
